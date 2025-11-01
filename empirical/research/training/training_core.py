@@ -470,34 +470,6 @@ def optimize_step(model, optimizers, step, args):
     muon_opt = optimizers[1] if len(optimizers) > 1 else None
     muon_params = opt2params.get(muon_opt, [])
 
-    # 0) If hidden optimizer is SpectralEcho, compute A pre-averaging for sigma^2
-    from empirical.research.training.spectral_echo import SpectralEcho
-    is_spectral = (muon_opt is not None and isinstance(muon_opt, SpectralEcho) and len(muon_params) > 0)
-    if is_spectral:
-        a_local = torch.zeros(len(muon_params), device=torch.device("cuda"), dtype=torch.float32)
-        a_slices_map: dict[Tensor, torch.Tensor] = {}
-        for idx, p in enumerate(muon_params):
-            if p.grad is not None:
-                g = p.grad.float()
-                if g.ndim == 3 and g.size(0) == 4:
-                    H, W = g.size(-2), g.size(-1)
-                    a_slices = torch.zeros(4, device=g.device, dtype=torch.float32)
-                    for i in range(4):
-                        gi = g[i]
-                        a_slices[i] = (gi.mul(gi).sum() / (H * W))
-                    a_slices_map[p] = a_slices
-                    a_local[idx] = (g.mul(g).sum() / p.numel())
-                else:
-                    a_local[idx] = (g.mul(g).sum() / p.numel())
-            else:
-                a_local[idx] = 0.0
-        dist.all_reduce(a_local, op=dist.ReduceOp.AVG)
-        for p, vec in a_slices_map.items():
-            dist.all_reduce(vec, op=dist.ReduceOp.AVG)
-    else:
-        a_local = None
-        a_slices_map = {}
-
     # 1. Create async all_reduce futures for each optimizer's parameters
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
@@ -518,41 +490,6 @@ def optimize_step(model, optimizers, step, args):
     # 4. Wait for gradient sync
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
-
-    # 5. If SpectralEcho, compute B and assign sigma^2 directly to optimizer state BEFORE stepping
-    if is_spectral and a_local is not None:
-        W = dist.get_world_size() if dist.is_initialized() else 1
-        b_vec = torch.zeros_like(a_local)
-        b_slices_map: dict[Tensor, torch.Tensor] = {}
-        for idx, p in enumerate(muon_params):
-            if p.grad is not None:
-                gbar = p.grad.float()
-                if gbar.ndim == 3 and gbar.size(0) == 4:
-                    H, W_ = gbar.size(-2), gbar.size(-1)
-                    b_slices = torch.zeros(4, device=gbar.device, dtype=torch.float32)
-                    for i in range(4):
-                        gi = gbar[i]
-                        b_slices[i] = (gi.mul(gi).sum() / (H * W_))
-                    b_slices_map[p] = b_slices
-                    b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
-                else:
-                    b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
-            else:
-                b_vec[idx] = 0.0
-        denom = 1.0 - (1.0 / float(max(W, 1)))
-        sigma2_vec = torch.zeros_like(a_local) if denom <= 0.0 else torch.clamp_min(a_local - b_vec, 0.0) / denom
-        sigma2_slices_map: dict[Tensor, torch.Tensor] = {}
-        for p in a_slices_map.keys():
-            a_s = a_slices_map[p]
-            b_s = b_slices_map.get(p, torch.zeros_like(a_s))
-            sigma2_slices = torch.zeros_like(a_s) if denom <= 0.0 else torch.clamp_min(a_s - b_s, 0.0) / denom
-            sigma2_slices_map[p] = sigma2_slices
-        # Assign into optimizer state
-        for idx, p in enumerate(muon_params):
-            if p in sigma2_slices_map:
-                muon_opt.state[p]['noise_sigma2'] = [float(x) for x in sigma2_slices_map[p].detach().cpu().tolist()]
-            else:
-                muon_opt.state[p]['noise_sigma2'] = float(sigma2_vec[idx].item())
 
     # 6. Step optimizers
     for opt in optimizers:
