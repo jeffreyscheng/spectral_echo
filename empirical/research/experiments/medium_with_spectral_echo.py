@@ -5,7 +5,7 @@ from empirical.research.training.training_core import (
 )
 from empirical.research.training.zeropower import get_zeropower_function, make_update_function
 # from empirical.research.training.muon import Muon
-from empirical.research.training.echo import SpectralEcho as Muon
+from empirical.research.training.echo import SpectralEcho
 
 from empirical.research.analysis.logging_utilities import serialize_model_checkpoint
 import torch
@@ -15,7 +15,7 @@ loggers = []
 
 def build_hidden_optimizer_muon(params, *, model, param_to_name, device, rank, world_size, lr, weight_decay, momentum):
     update_fn = make_update_function(get_zeropower_function("newton_schulz", {}))
-    return Muon(params, update_fn, lr=lr, momentum=momentum, rank=rank, world_size=world_size)
+    return SpectralEcho(params, lr=lr, momentum=momentum, rank=rank, world_size=world_size)
 
 model, optimizers = create_gpt_with_optimizer(args=args, build_hidden_optimizer_fn=build_hidden_optimizer_muon)
 train_loader = create_train_loader(args)
