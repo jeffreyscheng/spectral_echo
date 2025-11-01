@@ -33,7 +33,7 @@ class SpectralEcho(Optimizer):
         bufs = [torch.empty_like(G_local) for _ in range(self.world_size)]
         dist.all_gather(bufs, G_local.contiguous())
         return torch.stack(bufs, dim=0)  # [R,H,W]
-
+    
     @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:
@@ -43,42 +43,58 @@ class SpectralEcho(Optimizer):
             lr = group["lr"]; wd = group["weight_decay"]; mu = group["momentum"]
 
             for p in group["params"]:
-                if p.ndim < 2 or p.grad is None:
+                if p.grad is None or p.ndim < 2:
                     continue
 
-                # decoupled WD
+                # Decoupled WD
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd)
 
-                # momentum on mean gradient (post-allreduce)
                 gbar = p.grad.detach().float()
+
+                # Momentum buffer (same shape as p)
                 m = self._m.get(p)
                 if m is None:
                     m = torch.zeros_like(gbar, dtype=torch.float32)
                     self._m[p] = m
                 m.mul_(mu).add_(gbar, alpha=(1.0 - mu))
 
-                # gather replicas of local grads and align
-                G_repl = self._gather(self._local[p])  # [R,H,W]
-                U_aligned, _, V_aligned = get_aligned_svds(G_repl)  # U:(R,H,D), V:(R,W,D)
-                # echoes per-replica, per-direction
-                echoes = solve_for_spectral_echo_using_reverb(
-                    left_bases_U=U_aligned,            # (R,H,D)
-                    right_bases_V=V_aligned,           # (R,W,D)
-                )                                      # (R,D)
+                # Gather local pre-allreduce grads for reverb
+                G_repl_full = self._gather(self._local[p].float())  # shape: [R, ...p.shape]
 
-                # aggregate echoes across replicas
-                zeta = echoes.median(dim=0).values     # (D,)
+                if p.ndim == 2:
+                    # --- 2D case: [H, W] ---
+                    U_aligned, _, V_aligned = get_aligned_svds(G_repl_full)       # (R,H,D),(R,W,D)
+                    echoes = solve_for_spectral_echo_using_reverb(U_aligned, V_aligned)  # (R,D)
+                    zeta = echoes.median(dim=0).values                              # (D,)
 
-                # spectral update in momentum-mean basis
-                U, S, Vh = torch.linalg.svd(m, full_matrices=False)
-                V = Vh.transpose(-2, -1)
-                r = zeta.numel()
-                U_r = U[:, :r]
-                V_r = V[:, :r]
-                # U diag(zeta) V^T  (broadcast scaling of columns in U)
-                update = (U_r * zeta.unsqueeze(0)) @ V_r.transpose(0, 1)
+                    U, S, Vh = torch.linalg.svd(m, full_matrices=False)             # m is [H,W]
+                    V = Vh.transpose(-2, -1)
+                    D = zeta.numel()
+                    update = (U[:, :D] * zeta.unsqueeze(0)) @ V[:, :D].transpose(0, 1)
+                    p.add_(update, alpha=-lr)
 
-                p.add_(update, alpha=-lr)
+                elif p.ndim == 3:
+                    # --- 3D slice-stacked case: [S, H, W] ---
+                    Slices = p.shape[0]
+                    upd = torch.zeros_like(p, dtype=torch.float32)
+
+                    for s in range(Slices):
+                        G_repl = G_repl_full[:, s, :, :]                            # [R,H,W]
+                        U_aligned, _, V_aligned = get_aligned_svds(G_repl)          # (R,H,D),(R,W,D)
+                        echoes = solve_for_spectral_echo_using_reverb(U_aligned, V_aligned)  # (R,D)
+                        zeta = echoes.median(dim=0).values                          # (D,)
+
+                        U, S, Vh = torch.linalg.svd(m[s], full_matrices=False)      # m[s]: [H,W]
+                        V = Vh.transpose(-2, -1)
+                        D = zeta.numel()
+                        upd[s] = (U[:, :D] * zeta.unsqueeze(0)) @ V[:, :D].transpose(0, 1)
+
+                    p.add_(upd, alpha=-lr)
+
+                else:
+                    # Not supported here (you only optimize 2D and [4,H,W] hidden params)
+                    continue
 
         return None
+
