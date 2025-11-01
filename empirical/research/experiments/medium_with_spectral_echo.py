@@ -4,7 +4,9 @@ from empirical.research.training.training_core import (
     should_validate, validate_and_log, train_step, optimize_step, run_loggers, _global_print0
 )
 from empirical.research.training.zeropower import get_zeropower_function, make_update_function
-from empirical.research.training.muon import Muon
+# from empirical.research.training.muon import Muon
+from empirical.research.training.echo import SpectralEcho as Muon
+
 from empirical.research.analysis.logging_utilities import serialize_model_checkpoint
 import torch
 
