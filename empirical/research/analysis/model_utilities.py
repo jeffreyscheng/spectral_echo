@@ -204,9 +204,16 @@ def gather_microgradients_across_ranks(per_replicate_grads: Dict[Tuple[str, int]
     return payload[0]
 
 
-def get_accumulated_gradient_matrices(model, args, step: int, num_accumulation_steps: int,
-                                      assigned_params: set = None,
-                                      owner_map: Dict[Tuple[str, int], int] | None = None) -> GPTLayerProperty:
+def get_accumulated_gradient_matrices(
+    model,
+    args,
+    step: int,
+    num_accumulation_steps: int,
+    assigned_params: set = None,
+    owner_map: Dict[Tuple[str, int], int] | None = None,
+    accum_buffer_map: Dict[Tuple[str, int], torch.Tensor] | None = None,
+    accum_gamma: float = 0.0
+) -> GPTLayerProperty:
     """
     Compute accumulated gradient matrices for analysis.
     
@@ -313,7 +320,19 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_accumulation_s
         if not grad_list:
             continue
         # Expect exactly (world_size * num_accumulation_steps) entries per key
-        result[key] = torch.stack(grad_list, dim=0)
+        G = torch.stack(grad_list, dim=0)  # [R,H,W] (on CPU)
+        if accum_buffer_map is not None and key in accum_buffer_map and accum_gamma != 0.0:
+            B = accum_buffer_map[key]                    # [H,W]
+            # Match attention split shapes too (if caller passed Q/K/V/O separately this is already [H,W])
+            if B.ndim == G.ndim - 1:
+                # broadcast across replicas
+                A = (1.0 - accum_gamma) * G + accum_gamma * B.unsqueeze(0)
+            else:
+                # exact match [H,W]
+                A = (1.0 - accum_gamma) * G + accum_gamma * B
+            result[key] = A
+        else:
+            result[key] = G
 
     # Final synchronization and log once all sharing is complete across all minibatches
     if dist.is_initialized():

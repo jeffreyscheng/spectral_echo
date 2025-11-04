@@ -12,6 +12,7 @@ Usage:
 """
 import logging
 import os
+from pyexpat import model
 import sys
 import re
 from pathlib import Path
@@ -27,6 +28,7 @@ torch._inductor.config.coordinate_descent_tuning = False
 import torch.distributed as dist
 import numpy as np
 
+from empirical.research.analysis.model_utilities import _extract_layer_info as _extract
 from empirical.research.training.training_core import (
     setup_distributed_training, Hyperparameters,
 )
@@ -133,7 +135,27 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
     if dist.is_initialized():
         for param in target.parameters():
             dist.broadcast(param.detach(), 0)
-    return int(checkpoint_data['step'])
+    # Build param-name -> (param_type, layer) key map
+    name_to_key = {}
+    for name, _p in target.named_parameters():
+        k = _extract(name)
+        if k is not None:
+            name_to_key[name] = k
+
+    # Pull hidden optimizer meta (momentum buffers and group momentum)
+    opt_meta = checkpoint_data.get('hidden_optimizer_meta', {})
+    buf_by_key: Dict[Tuple[str, int], torch.Tensor] = {}
+    for pname, buf in opt_meta.get('momentum_buffers', {}).items():
+        k = name_to_key.get(pname, None)
+        if k is not None and buf.ndim >= 2:     # only matrices (hidden weights)
+            buf_by_key[k] = buf.contiguous()    # keep on CPU; shapes [H,W] or [4,H,W] parts handled later
+
+    # Use a single γ; if multiple groups exist, pick the first (hidden has one group in your setup)
+    group_momentum = opt_meta.get('group_momentum', [0.0])
+    gamma = float(group_momentum[0]) if group_momentum else 0.0
+
+    return int(checkpoint_data['step']), {'accum_buffers_by_key': buf_by_key, 'gamma': gamma}
+
 
 
 def shard_param_keys(all_keys: list[Tuple[str, int]], rank: int, world_size: int) -> set:
@@ -156,6 +178,7 @@ def compute_analysis_for_step(
     initial_props: GPTLayerProperty | None = None,
     specs: list[PropertySpec] | None = None,
     run_id: str | None = None,
+    opt_meta: Dict[str, Any] | None = None,
 ) -> GPTLayerProperty:
     """Core analysis function - clean and focused."""
     
@@ -179,7 +202,12 @@ def compute_analysis_for_step(
 
         # Accumulate and gather microgradients per-key to owners only; owners will have 8xA replicates
         gradients = get_accumulated_gradient_matrices(
-            model, args, step, num_accumulation_steps=num_accumulation_steps, assigned_params=my_param_keys, owner_map=owner_map
+            model, args, step,
+            num_accumulation_steps=num_accumulation_steps,
+            assigned_params=my_param_keys,
+            owner_map=owner_map,
+            accum_buffer_map=(opt_meta or {}).get('accum_buffers_by_key', {}),
+            accum_gamma=(opt_meta or {}).get('gamma', 0.0),
         )
         my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
         initial_props = combine_layer_properties(
@@ -462,8 +490,16 @@ def main():
     kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
     noise_panel_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
-        load_weights_into_model(ckpt, model, device)
-        local_payload = compute_analysis_for_step(step, num_accumulation_steps=NUM_ACCUMULATION_STEPS, rank=rank, world_size=world_size, model=model, run_id=run_id)
+        step_loaded, opt_meta = load_weights_into_model(ckpt, model, device)
+        local_payload = compute_analysis_for_step(
+            step_loaded,
+            num_accumulation_steps=NUM_ACCUMULATION_STEPS,
+            rank=rank,
+            world_size=world_size,
+            model=model,
+            run_id=run_id,
+            opt_meta=opt_meta,
+        )
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0:

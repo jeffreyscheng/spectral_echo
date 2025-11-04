@@ -4,7 +4,7 @@ Muon stands for **M**oment**U**m **O**rthogonalized by **N**ewton-Schulz.
 
 We will now build the final piece of the original Muon optimizer: incorporating momentum.
 
-In its simplest form, momentum reduces the variance of a gradient estimator by taking an exponentially-weighted moving average of a history of gradient estimates.
+In its simplest form, momentum reduces the variance of a gradient estimator by taking an exponentially-weighted moving average of a history of gradient estimates.  At checkpoint $t$, we notate the instantaneous gradient as $\nabla_{W_t} L$ and the accumulated gradient as $G_t$.
 
 $$
 \begin{aligned}

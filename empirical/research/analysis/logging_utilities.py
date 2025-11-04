@@ -13,7 +13,9 @@ import json
 import time
 import logging
 from pathlib import Path
+from turtle import st
 from typing import Dict, Any, Tuple
+from xml.parsers.expat import model
 import numpy as np
 import torch
 from torch.nn import Parameter
@@ -45,7 +47,7 @@ def is_logging_step_piecewise_log(step: int, total_steps: int) -> bool:
 
 def serialize_model_checkpoint(
     model,
-    _optimizer_unused,
+    hidden_optimizer,
     other_state: Dict[str, Any],
     run_name: str,
     checkpoint_dir: Path,
@@ -75,21 +77,31 @@ def serialize_model_checkpoint(
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = run_dir / f"model_step_{step:06d}.pt"
 
-    # Collect per-parameter Muon sigma if available (attached by training_core.optimize_step)
-    muon_sigma: Dict[str, float] = {}
-    for name, param in model.named_parameters():
-        if hasattr(param, "_muon_sigma"):
-            try:
-                muon_sigma[name] = float(getattr(param, "_muon_sigma"))
-            except Exception:
-                pass
+    # Map param Tensor -> name (for optimizer.state lookup)
+    name_of = {p: n for n, p in model.named_parameters()}
+
+    # Extract momentum buffers B from the hidden optimizer’s state
+    momentum_buffers: Dict[str, torch.Tensor] = {}
+    for p, st in hidden_optimizer.state.items():
+        if "momentum_buffer" in st:
+            name = name_of.get(p, None)
+            if name is not None:
+                momentum_buffers[name] = st["momentum_buffer"].detach().cpu()
+
+    # Current momentum γ (store per param group; usually a single group)
+    group_momentum = [float(g.get("momentum", 0.0)) for g in hidden_optimizer.param_groups]
+
 
     checkpoint = {
         'model': model.state_dict(),
         'step': step,
         'model_args': model_args,
         'timestamp': time.time(),
-        'muon_sigma': muon_sigma,
+        'hidden_optimizer_meta': {
+            'class': type(hidden_optimizer).__name__,
+            'group_momentum': group_momentum,
+            'momentum_buffers': momentum_buffers,
+        },
     }
     torch.save(checkpoint, checkpoint_file)
     return checkpoint_file
