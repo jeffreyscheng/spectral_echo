@@ -388,7 +388,7 @@ def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tens
     echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)    # (R,D)
     return echoes_zeta
 
-def get_aligned_svds_robust(empirical_gradients: torch.Tensor) -> tuple:
+def get_aligned_svds(empirical_gradients: torch.Tensor) -> tuple:
     """
     Align SVDs across replicates using noise-adaptive cluster Procrustes.
     
