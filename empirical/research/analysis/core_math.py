@@ -389,7 +389,7 @@ def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tens
     echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)    # (R,D)
     return echoes_zeta
 
-def get_aligned_svds_robust(
+def get_aligned_svds(
     empirical_gradients: torch.Tensor,
     cluster_threshold_factor: float = 1.5,  # Keep moderate
     max_cluster_frac: float = 0.1,  # NEW: max cluster size as fraction of total
