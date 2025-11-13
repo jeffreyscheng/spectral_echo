@@ -388,72 +388,86 @@ def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tens
     echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)    # (R,D)
     return echoes_zeta
 
-def get_aligned_svds(empirical_gradients: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_aligned_svds_robust(empirical_gradients: torch.Tensor) -> tuple:
     """
-    Greedy-only alignment of SVDs across replicates to a fixed reference (replica 0).
-    No Hungarian, no SciPy. Uses safe_svd.
-
+    Align SVDs across replicates using noise-adaptive cluster Procrustes.
+    
     Args:
-        empirical_gradients: (R, N, M) bf16/fp32
+        empirical_gradients: (R, n, m) tensor
+    
     Returns:
-        aligned_U: (R, N, D)
-        aligned_S_vals: (R, D)
-        aligned_V: (R, M, D)
+        aligned_U: (R, n, d)
+        aligned_S: (R, d) 
+        aligned_V: (R, m, d)
     """
-    # Promote dtype; compute batched SVDs
-    X = empirical_gradients.float() if empirical_gradients.dtype == torch.bfloat16 else empirical_gradients
-    U_all, S_vals, Vh_all = safe_svd(X)              # U:(R,N,D), S:(R,D), Vh:(R,D,M)
-    V_all = Vh_all.transpose(-2, -1)                 # (R,M,D)
-    R, N, D = U_all.shape
-
-    U_ref, V_ref = U_all[0], V_all[0]
-
-    def _greedy_perm(sim: torch.Tensor) -> torch.Tensor:
-        """sim: (D,D) >=0; returns perm idx p s.t. columns map j->row p[j]."""
-        K = sim.shape[0]
-        # tiny deterministic jitter to avoid exact ties
-        eps = 1e-12 if sim.dtype in (torch.float32, torch.float64) else 1e-6
-        jitter = eps * torch.linspace(0, 1, steps=sim.numel(), device=sim.device, dtype=sim.dtype).reshape_as(sim)
-        scores = sim + jitter
-        col_order = torch.argsort(scores.max(dim=0).values, descending=True)
-        used = torch.zeros(K, dtype=torch.bool, device=sim.device)
-        row_for_col = torch.full((K,), -1, dtype=torch.long, device=sim.device)
-        for j in col_order:
-            i = torch.argmax(scores[:, j])
-            if not used[i]:
-                row_for_col[j] = i
-                used[i] = True
-        free = torch.nonzero(~used, as_tuple=False).flatten()
-        kf = 0
-        for j in range(K):
-            if row_for_col[j] < 0:
-                row_for_col[j] = free[kf]; kf += 1
-        return row_for_col
-
-    aligned_U = torch.empty_like(U_all)
-    aligned_V = torch.empty_like(V_all)
-    aligned_S_vals = torch.empty_like(S_vals)
-    aligned_U[0], aligned_V[0], aligned_S_vals[0] = U_ref, V_ref, S_vals[0]
-
-    for i in range(1, R):
-        # similarity per column = |<u_i,u_ref>|*|<v_i,v_ref>|
-        sim_U = (U_all[i].transpose(0, 1) @ U_ref).abs()    # (D,D)
-        sim_V = (V_all[i].transpose(0, 1) @ V_ref).abs()    # (D,D)
-        sim = sim_U * sim_V
-        perm = _greedy_perm(sim)
-
-        U_perm = U_all[i][:, perm]
-        V_perm = V_all[i][:, perm]
-        S_perm = S_vals[i][perm]
-
-        # joint sign fix
-        u_overlap = (U_perm * U_ref).sum(dim=0)
-        v_overlap = (V_perm * V_ref).sum(dim=0)
-        sgn = torch.sign(u_overlap * v_overlap)
-        sgn[sgn == 0] = 1.0
-
-        aligned_U[i] = U_perm * sgn.unsqueeze(0)
-        aligned_V[i] = V_perm * sgn.unsqueeze(0)
-        aligned_S_vals[i] = S_perm
-
-    return aligned_U, aligned_S_vals, aligned_V
+    R, n, m = empirical_gradients.shape
+    d = min(n, m)
+    
+    # 1. Compute mean gradient and its SVD
+    G_mean = empirical_gradients.mean(dim=0)
+    U_mean, S_mean, Vh_mean = safe_svd(G_mean)
+    V_mean = Vh_mean.T
+    
+    # 2. Estimate noise level for adaptive clustering
+    sigma2 = estimate_gradient_noise_sigma2(empirical_gradients, G_mean)
+    tau_noise = np.sqrt(max(n, m) * sigma2)  # Scale by matrix dimension
+    
+    # 3. Detect clusters in mean singular values
+    gaps = S_mean[:-1] - S_mean[1:]
+    # Statistical threshold: gap must exceed noise floor to be "real"
+    c = 2.0  # Not a tunable hyperparameter; robust constant
+    is_boundary = gaps > c * tau_noise
+    
+    clusters = []
+    start = 0
+    for i, boundary in enumerate(is_boundary, 1):
+        if boundary:
+            clusters.append(range(start, i))
+            start = i
+    clusters.append(range(start, d))  # last cluster
+    
+    # 4. Align each replicate
+    aligned_U = torch.zeros(R, n, d, dtype=U_mean.dtype, device=U_mean.device)
+    aligned_V = torch.zeros(R, m, d, dtype=U_mean.dtype, device=U_mean.device)
+    aligned_S = torch.zeros(R, d, dtype=S_mean.dtype, device=S_mean.device)
+    
+    aligned_U[0] = U_mean
+    aligned_V[0] = V_mean
+    aligned_S[0] = S_mean
+    
+    for a in range(1, R):
+        U_a, S_a, Vh_a = safe_svd(empirical_gradients[a])
+        V_a = Vh_a.T
+        
+        # Process each cluster
+        for cluster in clusters:
+            idx = torch.tensor(list(cluster), device=U_mean.device)
+            k = len(cluster)
+            
+            if k == 1:
+                # Single vector: greedy sign correction
+                sim = (U_a[:, idx].T @ U_mean[:, idx]).squeeze() * \
+                      (V_a[:, idx].T @ V_mean[:, idx]).squeeze()
+                sgn = torch.sign(sim)
+                sgn = torch.where(sgn == 0, torch.tensor(1.0), sgn)
+                aligned_U[a, :, idx] = U_a[:, idx] * sgn
+                aligned_V[a, :, idx] = V_a[:, idx] * sgn
+            else:
+                # Cluster: Procrustes alignment
+                U_ref_block = U_mean[:, idx]      # [n, k]
+                V_ref_block = V_mean[:, idx]      # [m, k]
+                U_rep_block = U_a[:, idx]         # [n, k]
+                V_rep_block = V_a[:, idx]         # [m, k]
+                
+                # Left Procrustes
+                M_left = U_rep_block.T @ U_ref_block  # [k, k]
+                Omega_left, _, Psi_left = torch.linalg.svd(M_left, full_matrices=False)
+                Q_left = Omega_left @ Psi_left.T
+                
+                # Apply alignment
+                aligned_U[a, :, idx] = U_rep_block @ Q_left
+                aligned_V[a, :, idx] = V_rep_block @ Q_left
+                
+        aligned_S[a] = S_a
+    
+    return aligned_U, aligned_S, aligned_V
