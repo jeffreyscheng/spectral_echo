@@ -393,7 +393,6 @@ def get_aligned_svds(
     empirical_gradients: torch.Tensor,
     cluster_threshold_factor: float = 1.5,  # Keep moderate
     max_cluster_frac: float = 0.1,  # NEW: max cluster size as fraction of total
-    eps: float = 1e-12
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Robust SVD alignment with ultraconservative clustering.
@@ -411,7 +410,7 @@ def get_aligned_svds(
     
     # Estimate noise level
     sigma2 = estimate_gradient_noise_sigma2(empirical_gradients, G_mean)
-    noise_floor = torch.sqrt(max(n, m) * sigma2)
+    noise_floor = (max(n, m) * sigma2) ** 0.5
     
     # ULTRA-CONSERVATIVE cluster detection
     gaps = S_mean[:-1] - S_mean[1:]
