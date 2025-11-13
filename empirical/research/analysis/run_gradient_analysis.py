@@ -481,7 +481,7 @@ def main():
     # Optional testing flag: only run on first 2 checkpoints
     testing_mode = "--testing" in sys.argv
     if testing_mode:
-        checkpoints = checkpoints[:2]
+        checkpoints = checkpoints[-2:]
         log_from_rank(f"Testing mode enabled: processing {len(checkpoints)} checkpoints", rank)
     # Collect time series (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
