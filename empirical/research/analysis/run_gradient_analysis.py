@@ -464,6 +464,60 @@ def create_kappa_calibration_subplot(ax, panel: GPTLayerProperty, param_type: st
     ax.plot(xline, xline, ls='--', lw=1.2, color='black')
     return []
 
+def create_singular_gap_vs_sv_semilog_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+):
+    """
+    Scatter plot: local spectral gap Δs_i vs singular value s_i, on a log-x scale.
+
+    - x-axis: singular value s_i (log scale)
+    - y-axis: Δs_i = s_i - s_{i+1}
+    - color: layer depth (0..max_layers-1)
+    """
+    ax.set_title(param_type)
+    ax.set_xlabel("Singular value s (log scale)")
+    ax.set_ylabel("Local spectral gap Δsᵢ = sᵢ - sᵢ₊₁")
+    ax.set_xscale("log")
+    ax.grid(True, alpha=0.3)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+
+        sv = d.get("sv")
+        gap = d.get("gap")
+        if sv is None or gap is None:
+            continue
+
+        sv = np.asarray(sv, dtype=float)
+        gap = np.asarray(gap, dtype=float)
+
+        if sv.size == 0 or gap.size == 0:
+            continue
+
+        m = min(sv.size, gap.size)
+        sv = sv[:m]
+        gap = gap[:m]
+
+        # Filter out non-positive singulars for log-x safety
+        mask = np.isfinite(sv) & (sv > 0) & np.isfinite(gap)
+        if not np.any(mask):
+            continue
+
+        sv = sv[mask]
+        gap = gap[mask]
+
+        color = viridis(layer / denom)
+        ax.scatter(sv, gap, s=6, alpha=0.25, c=[color])
+
+    return []
+
+
 
 def main():
     if len(sys.argv) < 2:
@@ -489,6 +543,8 @@ def main():
     echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
     kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
     noise_panel_ts: Dict[int, GPTLayerProperty] = {}
+    sv_gap_ts: Dict[int, GPTLayerProperty] = {}
+
     for step, ckpt in checkpoints:
         step_loaded, opt_meta = load_weights_into_model(ckpt, model, device)
         local_payload = compute_analysis_for_step(
@@ -512,6 +568,7 @@ def main():
                 pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
                 noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
                 echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
+                sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             # Drop GPU-heavy payload immediately after extracting CPU arrays
             aggregated_payload = None
             local_payload = None
@@ -537,7 +594,14 @@ def main():
 
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts)
+        generate_gifs_for_run(
+            out_dir,
+            pred_actual_gptlp_ts,
+            echo_singular_direct_ts,
+            echo_singular_from_kappa_ts,
+            kappa_calibration_ts,
+            sv_gap_ts,
+        )
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
@@ -587,6 +651,46 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
             # optional shape guards
             assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
             assert out[key]['sv'].shape == out[key]['spectral_echo'].shape
+    return out
+
+def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Build per-layer panel for singular value *gaps* vs singular values.
+
+    For each layer:
+      - take median singular values across replicas (aligned_replicate_singular_values)
+      - assume they are sorted in descending order (SVD convention)
+      - define local gaps Δs_i = s_i - s_{i+1}
+      - drop the last singular value so sv and gap have the same length
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        s_rep = props["aligned_replicate_singular_values"]  # [B, Kc]
+        # Median over replicas, preserve ordering along the singular dimension
+        s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
+
+        if s_dir.size < 2:
+            # Not enough singulars to define a gap
+            continue
+
+        # SVD should give them in descending order; gaps are local differences
+        sv = s_dir.astype(float)
+        gap = sv[:-1] - sv[1:]          # Δs_i = s_i - s_{i+1}
+        n = gap.size
+        if n <= 0:
+            continue
+
+        shape = tuple(int(x) for x in props["checkpoint_weights"].shape[-2:])
+        out[key] = {
+            "sv": sv[:n],               # match gap length
+            "gap": gap,
+            "shape": shape,
+        }
+
+        # Shape sanity
+        assert out[key]["sv"].ndim == 1 and out[key]["gap"].ndim == 1
+        assert out[key]["sv"].shape == out[key]["gap"].shape
+
     return out
 
 
@@ -656,18 +760,26 @@ def build_kappa_calibration_panel(noise_panel: GPTLayerProperty, kappa_map: Dict
     return out
 
 
-def generate_gifs_for_run(out_dir: Path,
-                          pred_ts: Dict[int, GPTLayerProperty],
-                          echo_ts_direct: Dict[int, GPTLayerProperty],
-                          echo_ts_kappa: Dict[int, GPTLayerProperty],
-                          kappa_ts: Dict[int, GPTLayerProperty]):
+def generate_gifs_for_run(
+    out_dir: Path,
+    pred_ts: Dict[int, GPTLayerProperty],
+    echo_ts_direct: Dict[int, GPTLayerProperty],
+    echo_ts_kappa: Dict[int, GPTLayerProperty],
+    kappa_ts: Dict[int, GPTLayerProperty],
+    sv_gap_ts: Dict[int, GPTLayerProperty]
+):
     make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spectral_echo_subplot, title="pred_vs_actual_spectral_echo", output_dir=out_dir)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
     make_gif_from_layer_property_time_series(echo_ts_kappa, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_from_kappa", output_dir=out_dir)
     make_gif_from_layer_property_time_series(kappa_ts, create_kappa_calibration_subplot, title="kappa_calibration", output_dir=out_dir)
     # Normalized-x spectral-echo plot (using direct tau2 overlays)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_normalized_subplot, title="spectral_echo_vs_singular_values_normalized_direct", output_dir=out_dir)
-
+    make_gif_from_layer_property_time_series(
+        sv_gap_ts,
+        create_singular_gap_vs_sv_semilog_subplot,
+        title="singular_value_gap_vs_singular_value",
+        output_dir=out_dir,
+    )
 
 if __name__ == "__main__":
     sys.exit(main())
