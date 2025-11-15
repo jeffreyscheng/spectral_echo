@@ -464,7 +464,7 @@ def create_kappa_calibration_subplot(ax, panel: GPTLayerProperty, param_type: st
     ax.plot(xline, xline, ls='--', lw=1.2, color='black')
     return []
 
-def create_singular_gap_vs_sv_semilog_subplot(
+def create_singular_gap_vs_sv_loglog_subplot(
     ax,
     panel: GPTLayerProperty,
     param_type: str,
@@ -482,6 +482,7 @@ def create_singular_gap_vs_sv_semilog_subplot(
     ax.set_xlabel("Singular value s (log scale)")
     ax.set_ylabel("Local spectral gap Δsᵢ = sᵢ - sᵢ₊₁")
     ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
@@ -776,7 +777,7 @@ def generate_gifs_for_run(
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_normalized_subplot, title="spectral_echo_vs_singular_values_normalized_direct", output_dir=out_dir)
     make_gif_from_layer_property_time_series(
         sv_gap_ts,
-        create_singular_gap_vs_sv_semilog_subplot,
+        create_singular_gap_vs_sv_loglog_subplot,
         title="singular_value_gap_vs_singular_value",
         output_dir=out_dir,
     )
