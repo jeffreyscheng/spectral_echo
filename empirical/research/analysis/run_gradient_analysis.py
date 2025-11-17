@@ -42,8 +42,10 @@ from empirical.research.analysis.core_math import (
     stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
-    get_spectral_echoes_from_empirical_gradients,
+    get_spectral_echoes_from_aligned_svds,
     get_aligned_svds,
+    compute_kron_whitening_factors_from_residuals,
+    apply_kron_whitening,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -75,30 +77,80 @@ ANALYSIS_SPECS = [
     # Core gradient analysis
     PropertySpec("mean_gradient", ["per_replicate_gradient"], lambda grads: grads.mean(dim=0)),
 
-    # Alignment and SVDs using new logic
+    # Residuals for noise & whitening: E_r = G_r - Ḡ
+    PropertySpec(
+        "gradient_residuals",
+        ["per_replicate_gradient", "mean_gradient"],
+        lambda grads, mean: grads - mean.unsqueeze(0),
+    ),
+
+    # Whitening factors from residuals (left/right inverse square roots)
+    PropertySpec(
+        "gradient_whitening_factors",
+        ["gradient_residuals"],
+        compute_kron_whitening_factors_from_residuals,
+    ),
+
+    # Whitened per-replica gradients: G̃_r = W_L G_r W_R
+    PropertySpec(
+        "per_replicate_gradient_whitened",
+        ["per_replicate_gradient", "gradient_whitening_factors"],
+        apply_kron_whitening,
+    ),
+
+    # Alignment and SVDs on ORIGINAL gradients (for spectra, tau², etc.)
     PropertySpec("aligned_svds", ["per_replicate_gradient"], get_aligned_svds),  # (U,S,V)
     PropertySpec(
         "aligned_replicate_singular_values",
         ["aligned_svds"],
-        lambda aligned: aligned[1],  # already shape [R, D]
+        lambda aligned: aligned[1],  # [R, D]
     ),
     # Also expose as replicate singulars for downstream consumers/CSV
-    PropertySpec("replicate_singular_values", ["aligned_replicate_singular_values"], lambda x: x),
+    PropertySpec("replicate_singular_values",
+                 ["aligned_replicate_singular_values"],
+                 lambda x: x),
 
-    # Per-replica spectral echoes via new estimator, then aggregate across replicas
-    PropertySpec("spectral_echo_replicates", ["per_replicate_gradient"], get_spectral_echoes_from_empirical_gradients),  # [R,D]
-    PropertySpec("spectral_echo", ["spectral_echo_replicates"], lambda z: torch.median(z, dim=0).values.clamp(0.0, 1.0)),  # [D]
+    # Alignment and SVDs on WHITENED gradients (for Mahalanobis echo)
+    PropertySpec(
+        "aligned_svds_whitened",
+        ["per_replicate_gradient_whitened"],
+        get_aligned_svds,  # same function, different input
+    ),
 
-    # Per-replica gradient stable ranks from singulars
-    PropertySpec("gradients_stable_rank", ["aligned_replicate_singular_values"], gradients_stable_rank_from_singulars),
+    # Per-replica spectral echoes via reverb, on WHITENED aligned SVDs
+    PropertySpec(
+        "spectral_echo_replicates",
+        ["aligned_svds_whitened"],
+        get_spectral_echoes_from_aligned_svds,  # [R,D]
+    ),
+    PropertySpec(
+        "spectral_echo",
+        ["spectral_echo_replicates"],
+        lambda z: torch.median(z, dim=0).values.clamp(0.0, 1.0),  # [D]
+    ),
+
+    # Per-replica gradient stable ranks from singulars (original SVDs)
+    PropertySpec("gradients_stable_rank",
+                 ["aligned_replicate_singular_values"],
+                 gradients_stable_rank_from_singulars),
 
     # Misc annotations and noise/phase relationship
-    PropertySpec("aspect_ratio_beta", ["checkpoint_weights"], lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
+    PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
+                 lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
     PropertySpec("worker_count", ["per_replicate_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
-    PropertySpec("gradient_noise_sigma2", ["per_replicate_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
-    PropertySpec("empirical_phase_constant_tau2", ["aligned_replicate_singular_values", "spectral_echo"], fit_empirical_phase_constant_tau2),
+
+    # Noise σ² from original residuals
+    PropertySpec("gradient_noise_sigma2",
+                 ["per_replicate_gradient", "mean_gradient"],
+                 estimate_gradient_noise_sigma2),
+
+    # τ² fit: original singulars + (now Mahalanobis) spectral_echo
+    PropertySpec("empirical_phase_constant_tau2",
+                 ["aligned_replicate_singular_values", "spectral_echo"],
+                 fit_empirical_phase_constant_tau2),
 ]
+
 
 
 def build_compiled_model(device: torch.device):

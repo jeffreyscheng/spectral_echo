@@ -363,31 +363,52 @@ def solve_for_spectral_echo_using_reverb(
 
         return echoes
 
-def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tensor) -> torch.Tensor:
+def get_spectral_echoes_from_aligned_svds(
+    aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
     """
+    Compute per-replica spectral echoes from *aligned* SVD bases.
+
     Args:
-        empirical_gradients: (R, N, M) tensor of empirical gradients for R replicates.
+        aligned_svds: (U, S, V) where
+            U: [R, N, D]
+            S: [R, D]
+            V: [R, M, D]
+        (R = num_replicas, D = min(N, M))
+
     Returns:
-        echoes_zeta: (R, D) tensor of spectral echoes, where D = min(N, M).
+        echoes_zeta: [R, D] tensor of spectral echoes per replica, per direction.
     """
-    aligned_U, _, aligned_V = get_aligned_svds(empirical_gradients)  # U:(R,N,D), V:(R,M,D)
-    num_replicates_R, _, dim_D = aligned_U.shape
-    U_stacked = aligned_U.permute(2, 0, 1)  # (D,R,N)
-    V_stacked = aligned_V.permute(2, 0, 1)  # (D,R,M)
+    with torch.no_grad():
+        aligned_U, _, aligned_V = aligned_svds  # U:(R,N,D), V:(R,M,D)
+        if aligned_U.dtype == torch.bfloat16:
+            aligned_U = aligned_U.float()
+        if aligned_V.dtype == torch.bfloat16:
+            aligned_V = aligned_V.float()
 
-    # Build replica Gram matrices per direction: G[d] = U[d] @ U[d]^T and V[d] @ V[d]^T
-    # Einsum: sum over feature dimension (i), keep both replica indices (r,s)
-    gram_U = torch.einsum('dri,dsi->drs', U_stacked, U_stacked)        # (D,R,R)
-    gram_V = torch.einsum('dri,dsi->drs', V_stacked, V_stacked)        # (D,R,R)
-    reverb_tensor_Z = gram_U * gram_V                                    # (D,R,R)
-    reverb_tensor_Z = reverb_tensor_Z * (1 - torch.eye(num_replicates_R, device=reverb_tensor_Z.device, dtype=reverb_tensor_Z.dtype).unsqueeze(0))
+        num_replicates_R, _, dim_D = aligned_U.shape
 
-    zz = reverb_tensor_Z @ reverb_tensor_Z                               # (D,R,R)
-    numerator = (zz * reverb_tensor_Z.transpose(-1, -2)).sum(dim=-1)     # (D,R)
-    denominator = (reverb_tensor_Z * reverb_tensor_Z).sum(dim=(-2, -1)).clamp_min(torch.finfo(reverb_tensor_Z.dtype).eps)  # (D,)
-    echoes_sq = numerator / denominator.unsqueeze(-1)                     # (D,R)
-    echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)    # (R,D)
-    return echoes_zeta
+        # (D, R, N) and (D, R, M)
+        U_stacked = aligned_U.permute(2, 0, 1)
+        V_stacked = aligned_V.permute(2, 0, 1)
+
+        # Gram over feature dimension for each direction
+        gram_U = torch.einsum('dri,dsi->drs', U_stacked, U_stacked)  # (D,R,R)
+        gram_V = torch.einsum('dri,dsi->drs', V_stacked, V_stacked)  # (D,R,R)
+        reverb_tensor_Z = gram_U * gram_V                            # (D,R,R)
+
+        eye = torch.eye(num_replicates_R, device=reverb_tensor_Z.device, dtype=reverb_tensor_Z.dtype)
+        reverb_tensor_Z = reverb_tensor_Z * (1 - eye.unsqueeze(0))   # zero diag
+
+        # Triple-ratio estimator (same math as before)
+        zz = reverb_tensor_Z @ reverb_tensor_Z                       # (D,R,R)
+        numerator = (zz * reverb_tensor_Z.transpose(-1, -2)).sum(dim=-1)  # (D,R)
+        denominator = (reverb_tensor_Z * reverb_tensor_Z).sum(dim=(-2, -1))
+        denominator = denominator.clamp_min(torch.finfo(reverb_tensor_Z.dtype).eps)  # (D,)
+
+        echoes_sq = numerator / denominator.unsqueeze(-1)            # (D,R)
+        echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)  # (R,D)
+        return echoes_zeta
 
 def get_aligned_svds(
     empirical_gradients: torch.Tensor,
@@ -530,3 +551,85 @@ def get_aligned_svds(
         aligned_S[a] = S_a
     
     return aligned_U, aligned_S, aligned_V
+
+def compute_kron_whitening_factors_from_residuals(
+    residuals: torch.Tensor,
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """Estimate left/right whitening factors from residual gradients.
+
+    residuals: [R, H, W], centered per-replica gradients:
+        residuals[r] = G_r - G_bar
+
+    We approximate Σ ≈ C_R ⊗ C_L with
+        C_L = (1/(R-1)) Σ_r (G_r - Ḡ)(G_r - Ḡ)^T  ∈ R^{H×H}
+        C_R = (1/(R-1)) Σ_r (G_r - Ḡ)^T(G_r - Ḡ)  ∈ R^{W×W}
+
+    and return their inverse square roots:
+        W_L = C_L^{-1/2}, W_R = C_R^{-1/2}.
+    """
+    with torch.no_grad():
+        if residuals.dtype == torch.bfloat16:
+            residuals = residuals.float()
+        R, H, W = residuals.shape
+        if R <= 1:
+            # Not enough replicas to estimate covariance; identity whitening.
+            W_L = torch.eye(H, dtype=residuals.dtype, device=residuals.device)
+            W_R = torch.eye(W, dtype=residuals.dtype, device=residuals.device)
+            return {"left_inv_sqrt": W_L, "right_inv_sqrt": W_R}
+
+        # Unbiased denominator
+        denom = float(max(R - 1, 1))
+
+        # Compute C_L and C_R via batched einsums
+        # C_L[i,j] = 1/(R-1) Σ_{r,w} residuals[r,i,w] * residuals[r,j,w]
+        C_L = torch.einsum("rhw,rkw->hk", residuals, residuals) / denom  # [H,H]
+        # C_R[p,q] = 1/(R-1) Σ_{r,h} residuals[r,h,p] * residuals[r,h,q]
+        C_R = torch.einsum("rhp,rhq->pq", residuals, residuals) / denom  # [W,W]
+
+        def inv_sqrt_psd(C: torch.Tensor) -> torch.Tensor:
+            # Symmetric PSD inverse square root via eigh
+            evals, evecs = torch.linalg.eigh(C)
+            evals_clamped = torch.clamp(evals, min=eps)
+            inv_sqrt = evals_clamped.rsqrt()
+            # (evecs * inv_sqrt) @ evecs^T
+            return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.transpose(-2, -1)
+
+        W_L = inv_sqrt_psd(C_L)
+        W_R = inv_sqrt_psd(C_R)
+        return {"left_inv_sqrt": W_L, "right_inv_sqrt": W_R}
+
+
+def apply_kron_whitening(
+    per_replicate_gradient: torch.Tensor,
+    whitening_factors: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Apply Kronecker whitening to per-replica gradients.
+
+    Args:
+        per_replicate_gradient: [R, H, W]
+        whitening_factors: dict with
+            'left_inv_sqrt':  [H,H]
+            'right_inv_sqrt': [W,W]
+
+    Returns:
+        whitened_gradients: [R, H, W] with
+            G̃_r = W_L @ G_r @ W_R
+    """
+    with torch.no_grad():
+        G = per_replicate_gradient
+        if G.dtype == torch.bfloat16:
+            G = G.float()
+        R, H, W = G.shape
+
+        W_L = whitening_factors["left_inv_sqrt"]
+        W_R = whitening_factors["right_inv_sqrt"]
+
+        # Sanity: broadcast shapes must match per-layer dims
+        assert W_L.shape == (H, H), f"Left whitening shape {W_L.shape} != ({H},{H})"
+        assert W_R.shape == (W, W), f"Right whitening shape {W_R.shape} != ({W},{W})"
+
+        out = torch.empty_like(G, dtype=G.dtype, device=G.device)
+        for r in range(R):
+            out[r] = W_L @ G[r] @ W_R
+        return out
