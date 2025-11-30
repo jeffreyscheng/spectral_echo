@@ -413,44 +413,52 @@ def get_spectral_echoes_from_aligned_svds(
 def get_aligned_svds(
     empirical_gradients: torch.Tensor,
     cluster_threshold_factor: float = 1.5,  # Keep moderate
-    max_cluster_frac: float = 0.1,  # NEW: max cluster size as fraction of total
+    max_cluster_frac: float = 0.1,          # max cluster size as fraction of total
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Robust SVD alignment with ultraconservative clustering.
-    
-    Key principle: Convergence failures indicate mis-clustering, not numerical instability.
-    We prevent this by being extremely reluctant to merge directions.
+
+    Returns:
+        aligned_U: (R, n, d)
+        aligned_S: (R, d)
+        aligned_V: (R, m, d)
+
+    For every replicate a in {0, ..., R-1}, (aligned_U[a], aligned_S[a], aligned_V[a])
+    represents the SVD of empirical_gradients[a], but with U/V rotated and sign-fixed
+    within each cluster so that directions are aligned to the SVD of the mean gradient.
+    The mean SVD is used ONLY as a reference and is not returned.
     """
     R, n, m = empirical_gradients.shape
     d = min(n, m)
-    
-    # Compute mean gradient and its SVD
+
+    # --- Reference SVD (mean gradient) ---
     G_mean = empirical_gradients.mean(dim=0)
     U_mean, S_mean, Vh_mean = safe_svd(G_mean)
     V_mean = Vh_mean.T
-    
-    # Estimate noise level
+
+    # --- Estimate noise level ---
     sigma2 = estimate_gradient_noise_sigma2(empirical_gradients, G_mean)
     noise_floor = (max(n, m) * sigma2) ** 0.5
-    
-    # ULTRA-CONSERVATIVE cluster detection
+
+    # --- ULTRA-CONSERVATIVE cluster detection ---
     gaps = S_mean[:-1] - S_mean[1:]
-    
-    # Three-tier thresholding:
+
     # 1. Absolute noise-based threshold
     abs_threshold = cluster_threshold_factor * noise_floor
-    
-    # 2. Relative threshold: don't merge if gap > 5% of mean singular value
-    rel_threshold = 0.05 * S_mean[:-1]  # 5% of the larger singular value
-    
-    # 3. Zero-singularity threshold: don't merge if singular value < noise floor
-    # (these are noise directions anyway)
-    zero_mask = S_mean[:-1] < noise_floor
-    
+
+    # 2. Relative threshold: don't merge if gap > 5% of larger singular value
+    rel_threshold = 0.05 * S_mean[:-1]
+
+    # 3. Zero-singularity threshold: don't merge if *either* side is sub-noise
+    low_left  = S_mean[:-1] < noise_floor
+    low_right = S_mean[1:]  < noise_floor
+    zero_mask = low_left | low_right
+
     # Merge ONLY if ALL thresholds agree it's safe to merge
+    # => boundary if any threshold says "don't merge"
     is_boundary = (gaps > abs_threshold) | (gaps > rel_threshold) | zero_mask
-    
-    # Build clusters
+
+    # Build clusters from boundaries
     clusters = []
     start = 0
     for i, boundary in enumerate(is_boundary, 1):
@@ -458,99 +466,100 @@ def get_aligned_svds(
             clusters.append(list(range(start, i)))
             start = i
     clusters.append(list(range(start, d)))
-    
-    # CRITICAL: Enforce max cluster size
+
+    # --- Enforce max cluster size ---
     max_cluster_size = int(max_cluster_frac * d)
     if max_cluster_size < 2:
         max_cluster_size = 2  # Allow at least pairs
-    
-    # Split oversized clusters
-    final_clusters = []
+
+    final_clusters: list[list[int]] = []
     for cluster in clusters:
         if len(cluster) <= max_cluster_size:
             final_clusters.append(cluster)
         else:
-            # Split into chunks of max_cluster_size
             for i in range(0, len(cluster), max_cluster_size):
-                final_clusters.append(cluster[i:i+max_cluster_size])
-    
-    # If we have too many clusters (all isolated), warn
+                final_clusters.append(cluster[i:i + max_cluster_size])
+
     if len(final_clusters) == d:
         log_from_rank("Warning: All directions treated as isolated (clusters=dimensions)", 0)
-    
-    # Initialize outputs
+
+    # Prebuild index tensors to avoid reallocations
+    idx_tensors = [
+        torch.tensor(cluster, device=U_mean.device, dtype=torch.long)
+        for cluster in final_clusters
+    ]
+
+    # --- Initialize outputs ---
     aligned_U = torch.zeros(R, n, d, dtype=U_mean.dtype, device=U_mean.device)
     aligned_V = torch.zeros(R, m, d, dtype=U_mean.dtype, device=U_mean.device)
-    aligned_S = torch.zeros(R, d, dtype=S_mean.dtype, device=S_mean.device)
-    
-    aligned_U[0] = U_mean
-    aligned_V[0] = V_mean
-    aligned_S[0] = S_mean
-    
-    # Process replicates
-    for a in range(1, R):
+    aligned_S = torch.zeros(R, d,       dtype=S_mean.dtype, device=S_mean.device)
+
+    # --- Process all replicates, including 0 ---
+    for a in range(R):
         U_a, S_a, Vh_a = safe_svd(empirical_gradients[a])
         V_a = Vh_a.T
-        
-        for cluster in final_clusters:
-            idx = torch.tensor(cluster, device=U_mean.device)
-            
+
+        for cluster, idx in zip(final_clusters, idx_tensors):
             if len(cluster) == 1:
-                # Simple sign correction
+                # Simple sign correction vs reference
                 sim = (U_a[:, idx].T @ U_mean[:, idx]).squeeze() * \
                       (V_a[:, idx].T @ V_mean[:, idx]).squeeze()
                 sgn = torch.sign(sim)
-                sgn = torch.where(sgn == 0, torch.tensor(1.0), sgn)
+                sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
+
                 aligned_U[a, :, idx] = U_a[:, idx] * sgn
                 aligned_V[a, :, idx] = V_a[:, idx] * sgn
+
             else:
                 # Subspace alignment via Procrustes
                 U_ref_block = U_mean[:, idx]
                 V_ref_block = V_mean[:, idx]
                 U_rep_block = U_a[:, idx]
                 V_rep_block = V_a[:, idx]
-                
-                # Compute cross-covariance
-                M_left = U_rep_block.T @ U_ref_block  # Should be ~orthogonal
+
+                # Cross-covariance in the cluster
+                M_left  = U_rep_block.T @ U_ref_block   # ~ orthogonal
                 M_right = V_rep_block.T @ V_ref_block
-                
-                # The SVD of an orthogonal matrix is stable. If this fails,
-                # it means the subspaces aren't truly aligned AND shouldn't have been merged.
-                # We catch it and fall back to greedy (which is wrong but safe).
+
                 try:
+                    # SVD is stable for near-orthogonal matrices; if this blows up,
+                    # clustering was too aggressive.
                     Omega_left, _, Psi_left = torch.linalg.svd(M_left, full_matrices=False)
                     Omega_right, _, Psi_right = torch.linalg.svd(M_right, full_matrices=False)
-                    
-                    Q_left = Omega_left @ Psi_left.T
+
+                    Q_left  = Omega_left @ Psi_left.T
                     Q_right = Omega_right @ Psi_right.T
-                    
-                    # These should be nearly identical; average for symmetry
-                    Q = (Q_left + Q_right) / 2.0
-                    
-                    # Project back to orthogonal manifold (polar decomposition of Q)
+
+                    # Symmetrize left/right
+                    Q = 0.5 * (Q_left + Q_right)
+
+                    # Project back to O(k) via polar decomposition of Q
                     U_q, _, Vt_q = torch.linalg.svd(Q, full_matrices=False)
                     Q = U_q @ Vt_q
-                    
+
                     aligned_U[a, :, idx] = U_rep_block @ Q
                     aligned_V[a, :, idx] = V_rep_block @ Q
-                    
-                except torch._C._LinAlgError:
-                    # This should NEVER happen with conservative clustering
-                    log_from_rank(f"CRITICAL: SVD failed for cluster {cluster} size {len(cluster)}. "
-                                 f"This indicates a bug in cluster detection.", 0)
-                    
+
+                except (torch.linalg.LinAlgError, RuntimeError) as e:
+                    log_from_rank(
+                        f"CRITICAL: SVD failed for cluster {cluster} (size={len(cluster)}). "
+                        f"Treating directions as isolated. Error: {e}",
+                        0,
+                    )
                     # Emergency fallback: treat as isolated directions
-                    for j, orig_idx in enumerate(cluster):
-                        sim = (U_a[:, [orig_idx]].T @ U_mean[:, [orig_idx]]).squeeze() * \
-                              (V_a[:, [orig_idx]].T @ V_mean[:, [orig_idx]]).squeeze()
+                    for orig_idx in cluster:
+                        j = torch.tensor([orig_idx], device=U_mean.device)
+                        sim = (U_a[:, j].T @ U_mean[:, j]).squeeze() * \
+                              (V_a[:, j].T @ V_mean[:, j]).squeeze()
                         sgn = torch.sign(sim)
-                        sgn = torch.where(sgn == 0, torch.tensor(1.0), sgn)
+                        sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
                         aligned_U[a, :, orig_idx] = U_a[:, orig_idx] * sgn
                         aligned_V[a, :, orig_idx] = V_a[:, orig_idx] * sgn
-        
+
         aligned_S[a] = S_a
-    
+
     return aligned_U, aligned_S, aligned_V
+
 
 def compute_kron_whitening_factors_from_residuals(
     residuals: torch.Tensor,

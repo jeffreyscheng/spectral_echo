@@ -8,11 +8,12 @@ applied across model layers. By separating the "what" (property definitions) fro
 the "how" (execution), we achieve dramatically improved readability and maintainability.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id> [--testing]
+    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id> [--testing step ...]
 """
 import logging
+import argparse
+from datetime import datetime
 import os
-from pyexpat import model
 import sys
 import re
 from pathlib import Path
@@ -573,23 +574,32 @@ def create_singular_gap_vs_sv_loglog_subplot(
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python -m empirical.research.analysis.compute_gradient_distribution <run_id>")
-        return 1
+    parser = argparse.ArgumentParser(description="Gradient analysis runner")
+    parser.add_argument("run_id", type=str, help="Run identifier (subdir under research_logs/checkpoints)")
+    parser.add_argument("--testing", nargs="+", type=int, help="Only process the specified checkpoint steps (e.g., --testing 10 20)")
+    args_ns = parser.parse_args()
+
     # Lightweight logging setup
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-    run_id = sys.argv[1]
+
+    run_id = args_ns.run_id
+    requested_steps = set(args_ns.testing or [])
+
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
     # Skip step 0 checkpoints (many weights are zero-initialized there)
     checkpoints = [(s, p) for (s, p) in checkpoints if s > 0]
     log_from_rank(f"Filtered checkpoints (skip step 0): {len(checkpoints)} found", rank)
-    # Optional testing flag: only run on first 2 checkpoints
-    testing_mode = "--testing" in sys.argv
-    if testing_mode:
-        checkpoints = checkpoints[-2:]
-        log_from_rank(f"Testing mode enabled: processing {len(checkpoints)} checkpoints", rank)
+
+    # Testing mode: restrict to requested specific steps if provided
+    if requested_steps:
+        ckpt_map = {s: p for s, p in checkpoints}
+        missing = sorted(int(s) for s in requested_steps if s not in ckpt_map)
+        checkpoints = [(s, ckpt_map[s]) for s in sorted(requested_steps) if s in ckpt_map]
+        log_from_rank(f"Testing mode: requested steps {sorted(requested_steps)}; processing {len(checkpoints)} present steps", rank)
+        if missing and rank == 0:
+            logging.warning(f"Missing requested checkpoint steps: {missing}")
     # Collect time series (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
@@ -645,8 +655,11 @@ def main():
             kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
             echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(echo_singular_direct_ts[step], panel, kappa_map)
 
-        out_dir = Path(f"research_logs/visualizations/{run_id}")
+        # Single run-level output directory including run_id and timestamp
+        ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
+        out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Generate GIFs across the processed checkpoints (time series)
         generate_gifs_for_run(
             out_dir,
             pred_actual_gptlp_ts,
