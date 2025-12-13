@@ -5,6 +5,8 @@ FIELD_NAMES = [
     "gradients_stable_rank",
     "replicate_singular_values",
     "spectral_echo",
+    "rough_spectral_echo_with_singleton_alignment",
+    "pav_blocks",
     "empirical_phase_constant_tau2",
     "gradient_noise_sigma2",
     "aspect_ratio_beta",

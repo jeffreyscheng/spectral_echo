@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 
 from empirical.research.analysis.core_math import (
-    get_aligned_svds,
+    compute_alignment_bundle_pav_pass0_pass1,
     solve_for_spectral_echo_using_reverb,
 )
 
@@ -64,7 +64,8 @@ class SpectralEcho(Optimizer):
 
                 if p.ndim == 2:
                     # --- 2D case: [H, W] ---
-                    U_aligned, _, V_aligned = get_aligned_svds(G_repl_full)       # (R,H,D),(R,W,D)
+                    bundle = compute_alignment_bundle_pav_pass0_pass1(G_repl_full, G_repl_full.mean(dim=0))
+                    U_aligned, _, V_aligned = bundle["aligned_svds"]             # (R,H,D),(R,W,D)
                     echoes = solve_for_spectral_echo_using_reverb(U_aligned, V_aligned)  # (R,D)
                     zeta = echoes.median(dim=0).values                              # (D,)
 
@@ -81,7 +82,8 @@ class SpectralEcho(Optimizer):
 
                     for s in range(Slices):
                         G_repl = G_repl_full[:, s, :, :]                            # [R,H,W]
-                        U_aligned, _, V_aligned = get_aligned_svds(G_repl)          # (R,H,D),(R,W,D)
+                        bundle = compute_alignment_bundle_pav_pass0_pass1(G_repl, G_repl.mean(dim=0))
+                        U_aligned, _, V_aligned = bundle["aligned_svds"]             # (R,H,D),(R,W,D)
                         echoes = solve_for_spectral_echo_using_reverb(U_aligned, V_aligned)  # (R,D)
                         zeta = echoes.median(dim=0).values                          # (D,)
 
@@ -97,4 +99,3 @@ class SpectralEcho(Optimizer):
                     continue
 
         return None
-

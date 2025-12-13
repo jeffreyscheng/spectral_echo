@@ -49,9 +49,7 @@ from empirical.research.analysis.core_math import (
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
     get_spectral_echoes_from_aligned_svds,
-    get_aligned_svds,
-    compute_kron_whitening_factors_from_residuals,
-    apply_kron_whitening,
+    compute_alignment_bundle_pav_pass0_pass1,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -88,29 +86,27 @@ ANALYSIS_SPECS = [
     # Core gradient analysis
     PropertySpec("mean_gradient", ["per_replicate_gradient"], lambda grads: grads.mean(dim=0)),
 
-    # Residuals for noise & whitening: E_r = G_r - Ḡ
+    # Alignment bundle: pass0 singleton echo -> PAV blocks -> pass1 block alignment (SVDs computed once)
     PropertySpec(
-        "gradient_residuals",
+        "alignment_bundle",
         ["per_replicate_gradient", "mean_gradient"],
-        lambda grads, mean: grads - mean.unsqueeze(0),
+        compute_alignment_bundle_pav_pass0_pass1,
     ),
-
-    # Whitening factors from residuals (left/right inverse square roots)
     PropertySpec(
-        "gradient_whitening_factors",
-        ["gradient_residuals"],
-        compute_kron_whitening_factors_from_residuals,
+        "rough_spectral_echo_with_singleton_alignment",
+        ["alignment_bundle"],
+        lambda b: b["rough_echo_singleton"],
     ),
-
-    # Whitened per-replica gradients: G̃_r = W_L G_r W_R
     PropertySpec(
-        "per_replicate_gradient_whitened",
-        ["per_replicate_gradient", "gradient_whitening_factors"],
-        apply_kron_whitening,
+        "pav_blocks",
+        ["alignment_bundle"],
+        lambda b: b["pav_blocks"],
     ),
-
-    # Alignment and SVDs on ORIGINAL gradients (for spectra, tau², etc.)
-    PropertySpec("aligned_svds", ["per_replicate_gradient"], get_aligned_svds),  # (U,S,V)
+    PropertySpec(
+        "aligned_svds",
+        ["alignment_bundle"],
+        lambda b: b["aligned_svds"],  # (U,S,V) after pass1
+    ),
     PropertySpec(
         "aligned_replicate_singular_values",
         ["aligned_svds"],
@@ -121,17 +117,10 @@ ANALYSIS_SPECS = [
                  ["aligned_replicate_singular_values"],
                  lambda x: x),
 
-    # Alignment and SVDs on WHITENED gradients (for Mahalanobis echo)
-    PropertySpec(
-        "aligned_svds_whitened",
-        ["per_replicate_gradient_whitened"],
-        get_aligned_svds,  # same function, different input
-    ),
-
-    # Per-replica spectral echoes via reverb, on WHITENED aligned SVDs
+    # Per-replica spectral echoes via reverb, on aligned SVDs
     PropertySpec(
         "spectral_echo_replicates",
-        ["aligned_svds_whitened"],
+        ["aligned_svds"],
         get_spectral_echoes_from_aligned_svds,  # [R,D]
     ),
     PropertySpec(
@@ -156,7 +145,7 @@ ANALYSIS_SPECS = [
                  ["per_replicate_gradient", "mean_gradient"],
                  estimate_gradient_noise_sigma2),
 
-    # τ² fit: original singulars + (now Mahalanobis) spectral_echo
+    # τ² fit: singulars + (Euclidean) spectral_echo
     PropertySpec("empirical_phase_constant_tau2",
                  ["aligned_replicate_singular_values", "spectral_echo"],
                  fit_empirical_phase_constant_tau2),
@@ -343,6 +332,8 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "per_replicate_gradient_singular_values",
         "per_replicate_gradient_stable_rank",
         "spectral_echo",
+        "rough_spectral_echo_with_singleton_alignment",
+        "pav_blocks",
         "shape",
         "gradient_noise_sigma2",
         "empirical_phase_constant_tau2",
@@ -362,6 +353,8 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
+                'rough_spectral_echo_with_singleton_alignment': json.dumps(to_np16(props['rough_spectral_echo_with_singleton_alignment']).tolist()),
+                'pav_blocks': json.dumps([list(x) for x in props['pav_blocks']]),
                 'shape': json.dumps(list(props.get('shape', props['checkpoint_weights'].shape[-2:]))),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
