@@ -2,13 +2,18 @@
 """
 Refactored gradient distribution analysis with clean property pipeline architecture.
 
-This script computes gradient analysis using a declarative property pipeline approach.
+This script computes gradient analysis using a declarative property pipeline approach
+and writes artifacts so visualization can be rerun without recomputing SVDs.
 The core insight: gradient analysis is just a dependency graph of transformations
 applied across model layers. By separating the "what" (property definitions) from
 the "how" (execution), we achieve dramatically improved readability and maintainability.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id> [--testing step ...]
+    # Compute artifacts (expensive)
+    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.run_gradient_analysis <run_id> --mode compute
+
+    # Render from artifacts (cheap; no torchrun required)
+    python -m empirical.research.analysis.run_gradient_analysis <run_id> --mode render
 """
 import logging
 import argparse
@@ -60,6 +65,11 @@ from empirical.research.analysis.constants import (
     FIELD_NAMES,
     NUM_ACCUMULATION_STEPS,
     LOG_EVERY
+)
+from empirical.research.analysis.artifact_store import (
+    save_rank_artifact_shard,
+    load_step_artifacts,
+    list_artifact_steps,
 )
 
 def gradients_stable_rank_from_singulars(rep_singulars: torch.Tensor) -> torch.Tensor:
@@ -280,6 +290,7 @@ def compute_analysis_for_step(
 
     # Stream results to per-rank CSV to avoid large in-memory payloads
     stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
+    save_rank_artifact_shard(run_id or "unknown_run", step, rank, local_results)
 
     if dist.is_initialized():
         dist.barrier()
@@ -351,7 +362,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
-                'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
+                'shape': json.dumps(list(props.get('shape', props['checkpoint_weights'].shape[-2:]))),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
             }
@@ -576,6 +587,8 @@ def create_singular_gap_vs_sv_loglog_subplot(
 def main():
     parser = argparse.ArgumentParser(description="Gradient analysis runner")
     parser.add_argument("run_id", type=str, help="Run identifier (subdir under research_logs/checkpoints)")
+    parser.add_argument("--mode", choices=["compute", "render"], default="compute",
+                        help="compute: run expensive pipeline and write artifacts; render: load artifacts and plot")
     parser.add_argument("--testing", nargs="+", type=int, help="Only process the specified checkpoint steps (e.g., --testing 10 20)")
     args_ns = parser.parse_args()
 
@@ -585,10 +598,46 @@ def main():
     run_id = args_ns.run_id
     requested_steps = set(args_ns.testing or [])
 
+    if args_ns.mode == "render":
+        # Cheap path: no distributed, no model, no checkpoints.
+        steps = list_artifact_steps(run_id)
+        if requested_steps:
+            steps = [s for s in steps if s in requested_steps]
+        if not steps:
+            raise SystemExit(f"No artifacts found for run_id={run_id}. Did you run --mode compute?")
+
+        pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
+        echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
+        echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
+        kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
+        noise_panel_ts: Dict[int, GPTLayerProperty] = {}
+        sv_gap_ts: Dict[int, GPTLayerProperty] = {}
+
+        for step in steps:
+            aggregated_payload = load_step_artifacts(run_id, step)
+            pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
+            noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
+            echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
+            sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
+
+        combined_noise: GPTLayerProperty = {}
+        for panel in noise_panel_ts.values():
+            combined_noise.update(panel)
+        kappa_map = fit_per_type_kappa_loglog(combined_noise)
+        for step, panel in noise_panel_ts.items():
+            kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
+            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(echo_singular_direct_ts[step], panel, kappa_map)
+
+        ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
+        out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts, sv_gap_ts)
+        return 0
+
+    # --- Expensive compute path (distributed) ---
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
-    # Skip step 0 checkpoints (many weights are zero-initialized there)
     checkpoints = [(s, p) for (s, p) in checkpoints if s > 0]
     log_from_rank(f"Filtered checkpoints (skip step 0): {len(checkpoints)} found", rank)
 
@@ -600,17 +649,10 @@ def main():
         log_from_rank(f"Testing mode: requested steps {sorted(requested_steps)}; processing {len(checkpoints)} present steps", rank)
         if missing and rank == 0:
             logging.warning(f"Missing requested checkpoint steps: {missing}")
-    # Collect time series (rank 0 only)
-    pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
-    echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
-    echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
-    kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
-    noise_panel_ts: Dict[int, GPTLayerProperty] = {}
-    sv_gap_ts: Dict[int, GPTLayerProperty] = {}
 
     for step, ckpt in checkpoints:
         step_loaded, opt_meta = load_weights_into_model(ckpt, model, device)
-        local_payload = compute_analysis_for_step(
+        _local_payload = compute_analysis_for_step(
             step_loaded,
             num_accumulation_steps=NUM_ACCUMULATION_STEPS,
             rank=rank,
@@ -619,55 +661,8 @@ def main():
             run_id=run_id,
             opt_meta=opt_meta,
         )
-        # Gather layer properties from all ranks to rank 0 so we plot all layers
-        aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
-        if rank == 0:
-            layer_count = len(aggregated_payload) if isinstance(aggregated_payload, dict) else 0
-            log_from_rank(f"Rank 0 aggregated payload has {layer_count} layers", rank)
-            if layer_count == 0:
-                import logging as _logging
-                _logging.warning(f"Aggregated payload is empty on step {step}; skipping plotting for this step.")
-            else:
-                pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
-                noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
-                echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
-                sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
-            # Drop GPU-heavy payload immediately after extracting CPU arrays
-            aggregated_payload = None
-            local_payload = None
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
         if dist.is_initialized():
             dist.barrier()
-    if rank == 0:
-        # Fit global kappa across all checkpoints (per param type)
-        # Aggregate all noise panels
-        combined_noise: GPTLayerProperty = {}
-        for panel in noise_panel_ts.values():
-            combined_noise.update(panel)
-        kappa_map = fit_per_type_kappa_loglog(combined_noise)
-
-        # Build per-step kappa-derived panels using the same kappa_map
-        for step, panel in noise_panel_ts.items():
-            kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
-            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(echo_singular_direct_ts[step], panel, kappa_map)
-
-        # Single run-level output directory including run_id and timestamp
-        ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
-        out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # Generate GIFs across the processed checkpoints (time series)
-        generate_gifs_for_run(
-            out_dir,
-            pred_actual_gptlp_ts,
-            echo_singular_direct_ts,
-            echo_singular_from_kappa_ts,
-            kappa_calibration_ts,
-            sv_gap_ts,
-        )
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
@@ -680,7 +675,9 @@ def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerPro
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props['aligned_replicate_singular_values']  # torch [B,Kc]
+        s_rep = props.get('aligned_replicate_singular_values', None)
+        if s_rep is None:
+            s_rep = props['replicate_singular_values']      # torch [B,Kc]
         s_dir = torch.median(s_rep, dim=0).values           # torch [Kc]
         sv = s_dir.detach().cpu().numpy()
         actual = props['spectral_echo'].detach().cpu().numpy()
@@ -702,7 +699,9 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props['aligned_replicate_singular_values']                 # [B,Kc]
+        s_rep = props.get('aligned_replicate_singular_values', None)
+        if s_rep is None:
+            s_rep = props['replicate_singular_values']                     # [B,Kc]
         s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
         echo = props['spectral_echo'].detach().cpu().numpy()               # [Kc]
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
@@ -712,7 +711,7 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
                 'sv': s_dir[:n],
                 'spectral_echo': echo[:n],
                 'tau2': tau2,
-                'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
+                'shape': tuple(int(x) for x in props.get('shape', props['checkpoint_weights'].shape[-2:])),
             }
             # optional shape guards
             assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
@@ -731,7 +730,9 @@ def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerPr
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props["aligned_replicate_singular_values"]  # [B, Kc]
+        s_rep = props.get('aligned_replicate_singular_values', None)
+        if s_rep is None:
+            s_rep = props["replicate_singular_values"]      # [B, Kc]
         # Median over replicas, preserve ordering along the singular dimension
         s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
 
@@ -746,7 +747,7 @@ def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerPr
         if n <= 0:
             continue
 
-        shape = tuple(int(x) for x in props["checkpoint_weights"].shape[-2:])
+        shape = tuple(int(x) for x in props.get("shape", props["checkpoint_weights"].shape[-2:]))
         out[key] = {
             "sv": sv[:n],               # match gap length
             "gap": gap,
