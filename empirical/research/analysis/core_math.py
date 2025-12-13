@@ -17,6 +17,48 @@ import torch
 from empirical.research.analysis.model_utilities import GPTLayerProperty
 from empirical.research.analysis.logging_utilities import log_from_rank
 
+def _pav_blocks_monotone_decreasing(
+    y: torch.Tensor,
+    *,
+    hard_boundaries: torch.Tensor | None = None,  # length d-1, True forbids merge across i|i+1
+) -> list[tuple[int, int, float]]:
+    """
+    Pool-Adjacent-Violators for enforcing y[0] >= y[1] >= ... >= y[d-1],
+    with optional forbidden merge boundaries.
+
+    Returns list of blocks (start, end_exclusive, block_value).
+    """
+    # Work on CPU float64 for determinism/stability; d is ~1e3 so overhead is tiny.
+    y_np = y.detach().to(torch.float64).cpu().numpy()
+    hb = None
+    if hard_boundaries is not None:
+        hb = hard_boundaries.detach().cpu().numpy().astype(bool)
+
+    # Each stack element: [start, end, weight, value]
+    stack: list[list[float]] = []
+    for i, yi in enumerate(y_np.tolist()):
+        stack.append([float(i), float(i + 1), 1.0, float(yi)])
+        while len(stack) >= 2:
+            a = stack[-2]
+            b = stack[-1]
+            # boundary between a and b is at index (a.end-1)
+            boundary_idx = int(a[1] - 1)
+            if hb is not None and 0 <= boundary_idx < hb.shape[0] and hb[boundary_idx]:
+                break
+            # Monotone decreasing: require a.val >= b.val
+            if a[3] >= b[3]:
+                break
+            # Merge
+            w = a[2] + b[2]
+            v = (a[3] * a[2] + b[3] * b[2]) / w
+            stack[-2] = [a[0], b[1], w, v]
+            stack.pop()
+
+    out: list[tuple[int, int, float]] = []
+    for s, e, _w, v in stack:
+        out.append((int(s), int(e), float(v)))
+    return out
+
 
 def compute_stable_rank(singular_values: Union[np.ndarray, torch.Tensor], epsilon: float = 1e-8) -> float:
     """
@@ -145,7 +187,14 @@ def estimate_gradient_noise_sigma2(
         frob2_per_rep = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
         total_frob2 = torch.sum(frob2_per_rep)
         return float(total_frob2 / max(1, (B - 1) * m * n))
- 
+
+def _get_rank0() -> int:
+    try:
+        import torch.distributed as dist
+        return dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        return 0
+
 def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
     log_s = np.log(s)
     edges = np.linspace(log_s.min(), log_s.max(), nbins + 1)
@@ -498,11 +547,13 @@ def compute_alignment_bundle_pav_pass0_pass1(
     re-running SVDs.
     """
     with torch.no_grad():
+        rank = _get_rank0()
         R, n, m = empirical_gradients.shape
         d = min(n, m)
 
         # Reference SVD
-        U_mean, S_mean, Vh_mean = safe_svd(mean_gradient)
+        G_mean = mean_gradient
+        U_mean, S_mean, Vh_mean = safe_svd(G_mean)
         V_mean = Vh_mean.T
 
         # Replica SVDs (computed once)
@@ -526,12 +577,45 @@ def compute_alignment_bundle_pav_pass0_pass1(
 
         # Rough echoes from singleton alignment
         singleton_echo_reps = get_spectral_echoes_from_aligned_svds((U_rep, S_rep, V_rep))  # [R, d]
-        pav_info = compute_pav_blocks_from_singleton_echo_replicates(singleton_echo_reps)  # rough/pav/blocks
-        blocks: list[tuple[int, int]] = pav_info["blocks"]
+        rough_echo = torch.median(singleton_echo_reps, dim=0).values.clamp(0.0, 1.0)  # [d]
+
+        sigma2_hat = estimate_gradient_noise_sigma2(empirical_gradients, G_mean)
+
+        # --- forbid merges across resolvable spectral gaps
+        # noise op-norm estimate: ||E||_2 ~ sqrt(max(H,W) * sigma^2)
+        H, W = int(G_mean.shape[0]), int(G_mean.shape[1])
+        noise_op = float((max(H, W) * float(sigma2_hat)) ** 0.5)
+        gaps = (S_mean[:-1] - S_mean[1:]).clamp_min(0.0)  # [d-1]
+        hard_boundaries = gaps > noise_op  # [d-1] bool
+
+        # --- PAV (monotone decreasing in index; i.e. increasing in singular value)
+        pav_blocks = _pav_blocks_monotone_decreasing(
+            rough_echo,
+            hard_boundaries=hard_boundaries,
+        )
+
+        # --- logs: noise level, forbidden boundaries, and block sizes
+        sizes = [e - s for (s, e, _v) in pav_blocks]
+        sizes_sorted = sorted(sizes, reverse=True)
+        max_blk = sizes_sorted[0] if sizes_sorted else 0
+        med_blk = sizes_sorted[len(sizes_sorted) // 2] if sizes_sorted else 0
+        n_forbid = int(hard_boundaries.sum().item()) if gaps.numel() else 0
+        log_from_rank(
+            f"PAV(pass1): d={int(S_mean.numel())}  "
+            f"||E||_2≈{noise_op:.3g}  forbidden={n_forbid}/{int(gaps.numel())}  "
+            f"blocks={len(pav_blocks)}  max_blk={max_blk}  med_blk={med_blk}  "
+            f"top5={sizes_sorted[:5]}",
+            rank,
+        )
+
+        pav_echo = torch.empty_like(rough_echo)
+        for s, e, v in pav_blocks:
+            pav_echo[s:e] = float(v)
+        pav_echo = pav_echo.clamp(0.0, 1.0)
 
         # --- Pass 1: align within each PAV block (subspace Procrustes)
         for a in range(R):
-            for (s, e) in blocks:
+            for (s, e, _v) in pav_blocks:
                 k = e - s
                 if k <= 1:
                     continue
@@ -556,9 +640,9 @@ def compute_alignment_bundle_pav_pass0_pass1(
 
         return {
             "singleton_echo_replicates": singleton_echo_reps,  # [R, d]
-            "rough_echo_singleton": pav_info["rough_echo"],  # [d]
-            "pav_echo_singleton": pav_info["pav_echo"],  # [d]
-            "pav_blocks": blocks,  # list[(s,e)]
+            "rough_echo_singleton": rough_echo,  # [d]
+            "pav_echo_singleton": pav_echo,  # [d]
+            "pav_blocks": pav_blocks,  # list[(s,e,val)]
             "aligned_svds": (U_rep, S_rep, V_rep),  # final (pass 1)
         }
 
