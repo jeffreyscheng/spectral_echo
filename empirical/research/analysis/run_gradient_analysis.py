@@ -607,6 +607,7 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
     ax.set_xlabel("Singular value s (log scale)")
     ax.set_ylabel(r"$z=\sqrt{d}\cos(\theta)$")
     ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
