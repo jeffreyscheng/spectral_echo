@@ -6,7 +6,7 @@ the analysis pipeline. It provides both numpy and torch implementations where
 needed, with consistent interfaces.
 """
 
-from typing import Union, Tuple, Dict, List, Any
+from typing import Union, Tuple, Dict, List
 import numpy as np
 try:
     from scipy.optimize import curve_fit as _scipy_curve_fit
@@ -16,48 +16,6 @@ import torch
 
 from empirical.research.analysis.model_utilities import GPTLayerProperty
 from empirical.research.analysis.logging_utilities import log_from_rank
-
-def _pav_blocks_monotone_decreasing(
-    y: torch.Tensor,
-    *,
-    hard_boundaries: torch.Tensor | None = None,  # length d-1, True forbids merge across i|i+1
-) -> list[tuple[int, int, float]]:
-    """
-    Pool-Adjacent-Violators for enforcing y[0] >= y[1] >= ... >= y[d-1],
-    with optional forbidden merge boundaries.
-
-    Returns list of blocks (start, end_exclusive, block_value).
-    """
-    # Work on CPU float64 for determinism/stability; d is ~1e3 so overhead is tiny.
-    y_np = y.detach().to(torch.float64).cpu().numpy()
-    hb = None
-    if hard_boundaries is not None:
-        hb = hard_boundaries.detach().cpu().numpy().astype(bool)
-
-    # Each stack element: [start, end, weight, value]
-    stack: list[list[float]] = []
-    for i, yi in enumerate(y_np.tolist()):
-        stack.append([float(i), float(i + 1), 1.0, float(yi)])
-        while len(stack) >= 2:
-            a = stack[-2]
-            b = stack[-1]
-            # boundary between a and b is at index (a.end-1)
-            boundary_idx = int(a[1] - 1)
-            if hb is not None and 0 <= boundary_idx < hb.shape[0] and hb[boundary_idx]:
-                break
-            # Monotone decreasing: require a.val >= b.val
-            if a[3] >= b[3]:
-                break
-            # Merge
-            w = a[2] + b[2]
-            v = (a[3] * a[2] + b[3] * b[2]) / w
-            stack[-2] = [a[0], b[1], w, v]
-            stack.pop()
-
-    out: list[tuple[int, int, float]] = []
-    for s, e, _w, v in stack:
-        out.append((int(s), int(e), float(v)))
-    return out
 
 
 def compute_stable_rank(singular_values: Union[np.ndarray, torch.Tensor], epsilon: float = 1e-8) -> float:
@@ -187,13 +145,6 @@ def estimate_gradient_noise_sigma2(
         frob2_per_rep = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
         total_frob2 = torch.sum(frob2_per_rep)
         return float(total_frob2 / max(1, (B - 1) * m * n))
-
-def _get_rank0() -> int:
-    try:
-        import torch.distributed as dist
-        return dist.get_rank() if dist.is_initialized() else 0
-    except Exception:
-        return 0
 
 def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
     log_s = np.log(s)
@@ -458,193 +409,81 @@ def get_spectral_echoes_from_aligned_svds(
         echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)  # (R,D)
         return echoes_zeta
 
-def _pav_isotonic_nonincreasing(
-    y: torch.Tensor,
-    w: torch.Tensor,
-) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+
+def get_mean_svd(mean_gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Weighted isotonic regression with constraint y[0] >= y[1] >= ... >= y[d-1].
-    Returns (y_star, blocks) where blocks are (start, end) half-open index ranges.
+    SVD of the mean gradient, returned as (U, S, V) with V (not Vh).
+    Shapes:
+        U: [H, D], S: [D], V: [W, D], D=min(H,W)
     """
     with torch.no_grad():
-        if y.ndim != 1 or w.ndim != 1 or y.numel() != w.numel():
-            raise ValueError("PAV expects 1D y and w with the same length.")
-
-        device = y.device
-        dtype = y.dtype
-        y_np = y.detach().cpu().double().tolist()
-        w_np = w.detach().cpu().double().tolist()
-        d = len(y_np)
-
-        # stack entries: [start, end, w_sum, value]
-        stack: list[list[float]] = []
-        for i in range(d):
-            wi = float(w_np[i])
-            yi = float(y_np[i])
-            stack.append([i, i + 1, wi, yi])
-            # violation for non-increasing: previous block value < last block value
-            while len(stack) >= 2 and stack[-2][3] < stack[-1][3]:
-                b2 = stack.pop()
-                b1 = stack.pop()
-                wsum = b1[2] + b2[2]
-                val = (b1[3] * b1[2] + b2[3] * b2[2]) / wsum
-                stack.append([b1[0], b2[1], wsum, val])
-
-        y_star = torch.empty(d, dtype=torch.float64)
-        blocks: list[tuple[int, int]] = []
-        for s, e, _ws, val in stack:
-            s_i = int(s)
-            e_i = int(e)
-            y_star[s_i:e_i] = val
-            blocks.append((s_i, e_i))
-
-        return y_star.to(device=device, dtype=dtype), blocks
+        U, S, Vh = safe_svd(mean_gradient)
+        return U, S, Vh.T
 
 
-def compute_pav_blocks_from_singleton_echo_replicates(
-    singleton_echo_replicates: torch.Tensor,  # [R, D]
-    eps: float = 1e-8,
-) -> dict[str, Any]:
+def compute_alignment_angles_deg(
+    replicate_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mean_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build monotone blocks (fewest adjacent merges) by projecting the per-direction
-    echo estimates onto a non-increasing sequence via PAV.
+    Compute per-atom alignment angles (degrees) between each replicate's singular
+    directions and the mean-gradient singular directions.
 
     Returns:
-        {
-          "rough_echo": [D] median over pivots,
-          "pav_echo":   [D] isotonic (non-increasing) projection,
-          "blocks":     list[(start,end)] half-open ranges
-        }
+        left_angles_deg:  [R, D] where angle = arccos(|<u_rk, u_mean_k>|) in degrees
+        right_angles_deg: [R, D] where angle = arccos(|<v_rk, v_mean_k>|) in degrees
     """
     with torch.no_grad():
-        if singleton_echo_replicates.ndim != 2:
-            raise ValueError("singleton_echo_replicates must be [R, D].")
-        # point estimate + uncertainty from pivot-to-pivot variability
-        rough = torch.median(singleton_echo_replicates, dim=0).values.clamp(0.0, 1.0)  # [D]
-        var = singleton_echo_replicates.var(dim=0, unbiased=True).clamp_min(0.0)       # [D]
-        w = (var + eps).reciprocal()                                                   # [D]
+        U_rep, _S_rep, V_rep = replicate_svds  # U:[R,H,D], V:[R,W,D]
+        U_mean, _S_mean, V_mean = mean_svd  # U:[H,D],   V:[W,D]
 
-        pav_echo, blocks = _pav_isotonic_nonincreasing(rough, w)
-        pav_echo = pav_echo.clamp(0.0, 1.0)
-        return {"rough_echo": rough, "pav_echo": pav_echo, "blocks": blocks}
+        if U_rep.dtype == torch.bfloat16:
+            U_rep = U_rep.float()
+        if V_rep.dtype == torch.bfloat16:
+            V_rep = V_rep.float()
+        if U_mean.dtype == torch.bfloat16:
+            U_mean = U_mean.float()
+        if V_mean.dtype == torch.bfloat16:
+            V_mean = V_mean.float()
+
+        # dot per (r,k): sum_i U_rep[r,i,k] * U_mean[i,k]
+        dot_left = (U_rep * U_mean.unsqueeze(0)).sum(dim=1).abs()
+        dot_right = (V_rep * V_mean.unsqueeze(0)).sum(dim=1).abs()
+
+        dot_left = dot_left.clamp(0.0, 1.0)
+        dot_right = dot_right.clamp(0.0, 1.0)
+
+        left_angles = torch.rad2deg(torch.acos(dot_left))
+        right_angles = torch.rad2deg(torch.acos(dot_right))
+        return left_angles, right_angles
 
 
-def compute_alignment_bundle_pav_pass0_pass1(
-    empirical_gradients: torch.Tensor,  # [R, n, m]
-    mean_gradient: torch.Tensor,  # [n, m]
-) -> dict[str, Any]:
+def get_aligned_svds(
+    empirical_gradients: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Pass 0:
-      - SVD all replicas once
-      - singleton (per-direction) sign alignment to mean SVD
-      - estimate rough spectral echo across directions
-      - compute monotone-adjacent blocks via PAV
+    Per-replicate SVDs with *no* alignment / clustering / merging.
 
-    Pass 1:
-      - align within each PAV block via Procrustes (subspace alignment)
-
-    Returns a small dict so the pipeline can expose multiple nodes without
-    re-running SVDs.
+    Returns:
+        U: (R, H, D)
+        S: (R, D)
+        V: (R, W, D)
+    where D=min(H,W). Directions are the raw SVD directions of each replicate.
     """
     with torch.no_grad():
-        rank = _get_rank0()
-        R, n, m = empirical_gradients.shape
-        d = min(n, m)
-
-        # Reference SVD
-        G_mean = mean_gradient
-        U_mean, S_mean, Vh_mean = safe_svd(G_mean)
-        V_mean = Vh_mean.T
-
-        # Replica SVDs (computed once)
-        U_rep = torch.empty(R, n, d, dtype=U_mean.dtype, device=U_mean.device)
-        V_rep = torch.empty(R, m, d, dtype=U_mean.dtype, device=U_mean.device)
-        S_rep = torch.empty(R, d, dtype=S_mean.dtype, device=S_mean.device)
-        for a in range(R):
-            U_a, S_a, Vh_a = safe_svd(empirical_gradients[a])
-            U_rep[a] = U_a
-            V_rep[a] = Vh_a.T
-            S_rep[a] = S_a
-
-        # --- Pass 0: singleton sign alignment (no clustering)
-        for a in range(R):
-            u_dot = torch.sum(U_rep[a] * U_mean, dim=0)  # [d]
-            v_dot = torch.sum(V_rep[a] * V_mean, dim=0)  # [d]
-            sgn = torch.sign(u_dot * v_dot)
-            sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
-            U_rep[a] = U_rep[a] * sgn.view(1, -1)
-            V_rep[a] = V_rep[a] * sgn.view(1, -1)
-
-        # Rough echoes from singleton alignment
-        singleton_echo_reps = get_spectral_echoes_from_aligned_svds((U_rep, S_rep, V_rep))  # [R, d]
-        rough_echo = torch.median(singleton_echo_reps, dim=0).values.clamp(0.0, 1.0)  # [d]
-
-        sigma2_hat = estimate_gradient_noise_sigma2(empirical_gradients, G_mean)
-
-        # --- forbid merges across resolvable spectral gaps
-        # noise op-norm estimate: ||E||_2 ~ sqrt(max(H,W) * sigma^2)
-        H, W = int(G_mean.shape[0]), int(G_mean.shape[1])
-        noise_op = float((max(H, W) * float(sigma2_hat)) ** 0.5)
-        gaps = (S_mean[:-1] - S_mean[1:]).clamp_min(0.0)  # [d-1]
-        hard_boundaries = gaps > noise_op  # [d-1] bool
-
-        # --- PAV (monotone decreasing in index; i.e. increasing in singular value)
-        pav_blocks = _pav_blocks_monotone_decreasing(
-            rough_echo,
-            hard_boundaries=hard_boundaries,
-        )
-
-        # --- logs: noise level, forbidden boundaries, and block sizes
-        sizes = [e - s for (s, e, _v) in pav_blocks]
-        sizes_sorted = sorted(sizes, reverse=True)
-        max_blk = sizes_sorted[0] if sizes_sorted else 0
-        med_blk = sizes_sorted[len(sizes_sorted) // 2] if sizes_sorted else 0
-        n_forbid = int(hard_boundaries.sum().item()) if gaps.numel() else 0
-        log_from_rank(
-            f"PAV(pass1): d={int(S_mean.numel())}  "
-            f"||E||_2≈{noise_op:.3g}  forbidden={n_forbid}/{int(gaps.numel())}  "
-            f"blocks={len(pav_blocks)}  max_blk={max_blk}  med_blk={med_blk}  "
-            f"top5={sizes_sorted[:5]}",
-            rank,
-        )
-
-        pav_echo = torch.empty_like(rough_echo)
-        for s, e, v in pav_blocks:
-            pav_echo[s:e] = float(v)
-        pav_echo = pav_echo.clamp(0.0, 1.0)
-
-        # --- Pass 1: align within each PAV block (subspace Procrustes)
-        for a in range(R):
-            for (s, e, _v) in pav_blocks:
-                k = e - s
-                if k <= 1:
-                    continue
-                U_ref = U_mean[:, s:e]  # [n,k]
-                V_ref = V_mean[:, s:e]  # [m,k]
-                U_blk = U_rep[a, :, s:e]  # [n,k]
-                V_blk = V_rep[a, :, s:e]  # [m,k]
-
-                M_left = U_blk.T @ U_ref
-                M_right = V_blk.T @ V_ref
-
-                Omega_l, _, Psi_l = torch.linalg.svd(M_left, full_matrices=False)
-                Omega_r, _, Psi_r = torch.linalg.svd(M_right, full_matrices=False)
-                Q_left = Omega_l @ Psi_l.T
-                Q_right = Omega_r @ Psi_r.T
-                Q = 0.5 * (Q_left + Q_right)
-                Uq, _, Vtq = torch.linalg.svd(Q, full_matrices=False)
-                Q = Uq @ Vtq
-
-                U_rep[a, :, s:e] = U_blk @ Q
-                V_rep[a, :, s:e] = V_blk @ Q
-
-        return {
-            "singleton_echo_replicates": singleton_echo_reps,  # [R, d]
-            "rough_echo_singleton": rough_echo,  # [d]
-            "pav_echo_singleton": pav_echo,  # [d]
-            "pav_blocks": pav_blocks,  # list[(s,e,val)]
-            "aligned_svds": (U_rep, S_rep, V_rep),  # final (pass 1)
-        }
+        R, H, W = empirical_gradients.shape
+        U_list: list[torch.Tensor] = []
+        S_list: list[torch.Tensor] = []
+        V_list: list[torch.Tensor] = []
+        for r in range(R):
+            U, S, Vh = safe_svd(empirical_gradients[r])
+            U_list.append(U)
+            S_list.append(S)
+            V_list.append(Vh.T)
+        U_rep = torch.stack(U_list, dim=0)  # (R,H,D)
+        S_rep = torch.stack(S_list, dim=0)  # (R,D)
+        V_rep = torch.stack(V_list, dim=0)  # (R,W,D)
+        return U_rep, S_rep, V_rep
 
 
 def compute_kron_whitening_factors_from_residuals(

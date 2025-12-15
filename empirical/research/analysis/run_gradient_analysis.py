@@ -49,7 +49,9 @@ from empirical.research.analysis.core_math import (
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
     get_spectral_echoes_from_aligned_svds,
-    compute_alignment_bundle_pav_pass0_pass1,
+    get_aligned_svds,
+    get_mean_svd,
+    compute_alignment_angles_deg,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -86,27 +88,18 @@ ANALYSIS_SPECS = [
     # Core gradient analysis
     PropertySpec("mean_gradient", ["per_replicate_gradient"], lambda grads: grads.mean(dim=0)),
 
-    # Alignment bundle: pass0 singleton echo -> PAV blocks -> pass1 block alignment (SVDs computed once)
+    # Mean SVD (for alignment diagnostics only; not serialized)
+    PropertySpec("mean_svd", ["mean_gradient"], get_mean_svd),  # (U,S,V)
+
+    # Residuals (only for sigma^2; cheap and useful)
     PropertySpec(
-        "alignment_bundle",
+        "gradient_residuals",
         ["per_replicate_gradient", "mean_gradient"],
-        compute_alignment_bundle_pav_pass0_pass1,
+        lambda grads, mean: grads - mean.unsqueeze(0),
     ),
-    PropertySpec(
-        "rough_spectral_echo_with_singleton_alignment",
-        ["alignment_bundle"],
-        lambda b: b["rough_echo_singleton"],
-    ),
-    PropertySpec(
-        "pav_blocks",
-        ["alignment_bundle"],
-        lambda b: b["pav_blocks"],
-    ),
-    PropertySpec(
-        "aligned_svds",
-        ["alignment_bundle"],
-        lambda b: b["aligned_svds"],  # (U,S,V) after pass1
-    ),
+
+    # Per-replicate SVDs (NO alignment / clustering / merges)
+    PropertySpec("aligned_svds", ["per_replicate_gradient"], get_aligned_svds),  # (U,S,V) raw
     PropertySpec(
         "aligned_replicate_singular_values",
         ["aligned_svds"],
@@ -117,12 +110,20 @@ ANALYSIS_SPECS = [
                  ["aligned_replicate_singular_values"],
                  lambda x: x),
 
-    # Per-replica spectral echoes via reverb, on aligned SVDs
+    # Alignment diagnostics: per-atom angles vs mean-gradient directions
     PropertySpec(
-        "spectral_echo_replicates",
-        ["aligned_svds"],
-        get_spectral_echoes_from_aligned_svds,  # [R,D]
+        "left_alignment_angles_deg",
+        ["aligned_svds", "mean_svd"],
+        lambda rep, mean: compute_alignment_angles_deg(rep, mean)[0],  # [R,D]
     ),
+    PropertySpec(
+        "right_alignment_angles_deg",
+        ["aligned_svds", "mean_svd"],
+        lambda rep, mean: compute_alignment_angles_deg(rep, mean)[1],  # [R,D]
+    ),
+
+    # Spectral echo (classic reverb on aligned svds; no whitening, no PAV)
+    PropertySpec("spectral_echo_replicates", ["aligned_svds"], get_spectral_echoes_from_aligned_svds),
     PropertySpec(
         "spectral_echo",
         ["spectral_echo_replicates"],
@@ -145,7 +146,7 @@ ANALYSIS_SPECS = [
                  ["per_replicate_gradient", "mean_gradient"],
                  estimate_gradient_noise_sigma2),
 
-    # τ² fit: singulars + (Euclidean) spectral_echo
+    # τ² fit: original singulars + spectral_echo
     PropertySpec("empirical_phase_constant_tau2",
                  ["aligned_replicate_singular_values", "spectral_echo"],
                  fit_empirical_phase_constant_tau2),
@@ -332,8 +333,6 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "per_replicate_gradient_singular_values",
         "per_replicate_gradient_stable_rank",
         "spectral_echo",
-        "rough_spectral_echo_with_singleton_alignment",
-        "pav_blocks",
         "shape",
         "gradient_noise_sigma2",
         "empirical_phase_constant_tau2",
@@ -353,8 +352,6 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
-                'rough_spectral_echo_with_singleton_alignment': json.dumps(to_np16(props['rough_spectral_echo_with_singleton_alignment']).tolist()),
-                'pav_blocks': json.dumps([list(x) for x in props['pav_blocks']]),
                 'shape': json.dumps(list(props.get('shape', props['checkpoint_weights'].shape[-2:]))),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
@@ -575,6 +572,63 @@ def create_singular_gap_vs_sv_loglog_subplot(
 
     return []
 
+def _create_alignment_angle_vs_sv_semilog_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+    which: str,  # "left" | "right"
+):
+    title = f"{param_type} ({which})"
+    ax.set_title(title)
+    ax.set_xlabel("Singular value s (log scale)")
+    ax.set_ylabel("Alignment angle (degrees)")
+    ax.set_xscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0.0, 90.0)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        sv = d.get("sv", None)
+        ang = d.get("angles", None)
+        if sv is None or ang is None:
+            continue
+        sv = np.asarray(sv, dtype=float)              # [D]
+        ang = np.asarray(ang, dtype=float)            # [R,D]
+        if sv.ndim != 1 or ang.ndim != 2:
+            continue
+        R = ang.shape[0]
+        D = min(sv.size, ang.shape[1])
+        if D <= 0:
+            continue
+        sv = sv[:D]
+        ang = ang[:, :D]
+
+        # flatten distribution: (R*D,)
+        xs = np.repeat(sv, R)
+        ys = ang.reshape(-1)
+        mask = np.isfinite(xs) & (xs > 0) & np.isfinite(ys)
+        if not np.any(mask):
+            continue
+        xs = xs[mask]
+        ys = ys[mask]
+
+        color = viridis(layer / denom)
+        ax.scatter(xs, ys, s=6, alpha=0.15, c=[color])
+
+    return []
+
+
+def create_left_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers, which="left")
+
+
+def create_right_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers, which="right")
+
 
 
 def main():
@@ -605,6 +659,8 @@ def main():
         kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
         noise_panel_ts: Dict[int, GPTLayerProperty] = {}
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
+        left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
+        right_align_panel_ts: Dict[int, GPTLayerProperty] = {}
 
         for step in steps:
             aggregated_payload = load_step_artifacts(run_id, step)
@@ -612,6 +668,8 @@ def main():
             noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
             echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
+            left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
+            right_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="right")
 
         combined_noise: GPTLayerProperty = {}
         for panel in noise_panel_ts.values():
@@ -624,7 +682,7 @@ def main():
         ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
         out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts, sv_gap_ts)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
         return 0
 
     # --- Expensive compute path (distributed) ---
@@ -753,6 +811,41 @@ def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerPr
 
     return out
 
+def build_alignment_angle_vs_sv_panel(
+    aggregated_payload: GPTLayerProperty,
+    which: str,  # "left" | "right"
+) -> GPTLayerProperty:
+    """
+    Per-layer panel:
+      - sv: median singular value per direction across replicas, shape [D]
+      - angles: per-replica alignment angles (degrees), shape [R,D]
+    """
+    out: GPTLayerProperty = {}
+    key_ang = "left_alignment_angles_deg" if which == "left" else "right_alignment_angles_deg"
+    for key, props in aggregated_payload.items():
+        s_rep = props.get("replicate_singular_values", None)
+        ang = props.get(key_ang, None)
+        if s_rep is None or ang is None:
+            continue
+        # s_rep: [R,D], ang: [R,D]
+        if isinstance(s_rep, torch.Tensor):
+            s_rep_t = s_rep
+        else:
+            s_rep_t = torch.as_tensor(s_rep)
+        s_dir = torch.median(s_rep_t, dim=0).values.detach().cpu().numpy()
+        ang_np = ang.detach().cpu().numpy() if isinstance(ang, torch.Tensor) else np.asarray(ang)
+
+        n = min(s_dir.size, ang_np.shape[1] if ang_np.ndim == 2 else 0)
+        if n <= 0:
+            continue
+        shape = tuple(int(x) for x in props.get("shape", props["checkpoint_weights"].shape[-2:]))
+        out[key] = {
+            "sv": s_dir[:n],
+            "angles": ang_np[:, :n],
+            "shape": shape,
+        }
+    return out
+
 
 def build_noise_to_phase_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
@@ -826,7 +919,9 @@ def generate_gifs_for_run(
     echo_ts_direct: Dict[int, GPTLayerProperty],
     echo_ts_kappa: Dict[int, GPTLayerProperty],
     kappa_ts: Dict[int, GPTLayerProperty],
-    sv_gap_ts: Dict[int, GPTLayerProperty]
+    sv_gap_ts: Dict[int, GPTLayerProperty],
+    left_align_ts: Dict[int, GPTLayerProperty],
+    right_align_ts: Dict[int, GPTLayerProperty],
 ):
     make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spectral_echo_subplot, title="pred_vs_actual_spectral_echo", output_dir=out_dir)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
@@ -840,6 +935,8 @@ def generate_gifs_for_run(
         title="singular_value_gap_vs_singular_value",
         output_dir=out_dir,
     )
+    make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_vs_sv_semilog_subplot, title="left_alignment_angle_vs_singular_value", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_angle_vs_singular_value", output_dir=out_dir)
 
 if __name__ == "__main__":
     sys.exit(main())
