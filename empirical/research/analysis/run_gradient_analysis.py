@@ -60,7 +60,6 @@ from empirical.research.analysis.core_visualization import (
     compute_panel_xs,
     predict_spectral_echo_curve_np,
     newton_schulz_quintic_function,
-    PARAM_TYPES,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
 from empirical.research.analysis.constants import (
@@ -211,16 +210,28 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
             name_to_key[name] = k
 
     # Pull hidden optimizer meta (momentum buffers and group momentum)
-    opt_meta = checkpoint_data.get('hidden_optimizer_meta', {})
+    if 'hidden_optimizer_meta' in checkpoint_data:
+        opt_meta = checkpoint_data['hidden_optimizer_meta']
+    else:
+        opt_meta = {}
     buf_by_key: Dict[Tuple[str, int], torch.Tensor] = {}
-    for pname, buf in opt_meta.get('momentum_buffers', {}).items():
-        k = name_to_key.get(pname, None)
+    if 'momentum_buffers' in opt_meta:
+        momentum_buffers = opt_meta['momentum_buffers']
+    else:
+        momentum_buffers = {}
+    for pname, buf in momentum_buffers.items():
+        if pname in name_to_key:
+            k = name_to_key[pname]
+        else:
+            k = None
         if k is not None and buf.ndim >= 2:     # only matrices (hidden weights)
             buf_by_key[k] = buf.contiguous()    # keep on CPU; shapes [H,W] or [4,H,W] parts handled later
 
     # Use a single γ; if multiple groups exist, pick the first (hidden has one group in your setup)
-    group_momentum = opt_meta.get('group_momentum', [0.0])
-    gamma = float(group_momentum[0]) if group_momentum else 0.0
+    if 'group_momentum' in opt_meta and opt_meta['group_momentum']:
+        gamma = float(opt_meta['group_momentum'][0])
+    else:
+        gamma = 0.0
 
     return int(checkpoint_data['step']), {'accum_buffers_by_key': buf_by_key, 'gamma': gamma}
 
@@ -274,8 +285,12 @@ def compute_analysis_for_step(
             num_accumulation_steps=num_accumulation_steps,
             assigned_params=my_param_keys,
             owner_map=owner_map,
-            accum_buffer_map=(opt_meta or {}).get('accum_buffers_by_key', {}),
-            accum_gamma=(opt_meta or {}).get('gamma', 0.0),
+            accum_buffer_map=(
+                {} if opt_meta is None else opt_meta['accum_buffers_by_key']
+            ),
+            accum_gamma=(
+                0.0 if opt_meta is None else float(opt_meta['gamma'])
+            ),
         )
         my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
         initial_props = combine_layer_properties(
@@ -433,9 +448,8 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sv = d.get('sv'); echo = d.get('spectral_echo')
-        if sv is None or echo is None:
-            continue
+        sv = d['sv']
+        echo = d['spectral_echo']
         sv = np.asarray(sv, dtype=float)
         echo = np.clip(np.asarray(echo, dtype=float), 0.0, 1.0)
         if sv.size == 0 or echo.size == 0:
@@ -457,8 +471,8 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        tau2 = d.get('tau2', None)
-        if tau2 is None:
+        tau2 = float(d['tau2'])
+        if not np.isfinite(tau2) or tau2 <= 0:
             continue
         color = viridis(layer / denom)
         y_pred = predict_spectral_echo_curve_np(xs, float(tau2)) if xs.size else np.array([])
@@ -469,75 +483,57 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
 
 def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(f"{param_type} (normalized s)")
-    ax.set_xlabel('Normalized singular value s/max(s) (log scale)')
+    ax.set_xlabel('Normalized singular value s/s_ref (log scale)')
     ax.set_ylabel('Spectral echo')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
     ax.set_ylim(0.0, 1.0)
+
+    # Robust reference scale per param_type: median of per-layer max(s).
+    smax_list = []
+    for (pt, _layer), d in panel.items():
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        sv0 = np.asarray(d['sv'], dtype=float)
+        if sv0.size == 0:
+            continue
+        smax0 = float(np.max(sv0))
+        if np.isfinite(smax0) and smax0 > 0:
+            smax_list.append(smax0)
+    s_ref = float(np.median(np.asarray(smax_list, dtype=float))) if smax_list else 1.0
+    if not np.isfinite(s_ref) or s_ref <= 0:
+        s_ref = 1.0
+
     denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sv = d.get('sv'); echo = d.get('spectral_echo')
-        if sv is None or echo is None:
-            continue
-        sv = np.asarray(sv, dtype=float)
-        echo = np.clip(np.asarray(echo, dtype=float), 0.0, 1.0)
+        sv = np.asarray(d['sv'], dtype=float)
+        echo = np.clip(np.asarray(d['spectral_echo'], dtype=float), 0.0, 1.0)
         if sv.size == 0 or echo.size == 0:
             continue
         m = min(sv.size, echo.size)
         sv = sv[:m]; echo = echo[:m]
-        smax = np.max(sv)
-        if smax <= 0:
+        if not np.all(np.isfinite(sv)):
             continue
-        svn = sv / smax
-        order = np.argsort(svn)
+        # Normalize by shared s_ref so the axis is comparable across layers and can exceed 1.
+        svn = sv / s_ref
         color = viridis(layer / denom)
+        mask = np.isfinite(svn) & (svn > 0) & np.isfinite(echo)
+        if not np.any(mask):
+            continue
+        svn = svn[mask]
+        echo = echo[mask]
+        order = np.argsort(svn)
         ax.scatter(svn[order], echo[order], s=6, alpha=0.25, c=[color])
-        tau2 = d.get('tau2', None)
-        if tau2 is None:
-            continue
-        y_pred = predict_spectral_echo_curve_np(sv[order], float(tau2))
-        ax.plot(svn[order], y_pred, color=color, lw=1.0, alpha=0.9)
-    return []
+        tau2 = float(d['tau2'])
+        if np.isfinite(tau2) and tau2 > 0:
+            # Prediction is still in terms of *true* singular values (sv), we just display x in normalized units.
+            sv_true = (svn[order] * s_ref).astype(float)
+            y_pred = predict_spectral_echo_curve_np(sv_true, float(tau2))
+            ax.plot(svn[order], y_pred, color=color, lw=1.0, alpha=0.9)
 
-
-def create_kappa_calibration_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
-    # Try to extract the fitted kappa for this param_type from the panel entries
-    kappa_val = None
-    for (pt, _layer), d in panel.items():
-        if pt == param_type and isinstance(d, dict) and 'kappa' in d:
-            try:
-                kappa_val = float(d['kappa'])
-            except Exception:
-                kappa_val = None
-            break
-    title = f"{param_type}" if kappa_val is None else f"{param_type} (κ={kappa_val:.3g})"
-    ax.set_title(title)
-    ax.set_xlabel('σ^2 · κ (log)')
-    ax.set_ylabel('Fitted τ^2 (log)')
-    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, which='both', alpha=0.3)
-    # Collect per-layer points
-    xs, ys, layers = [], [], []
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
-        if 'x_cal' not in d or 'y' not in d:
-            continue
-        x_cal = float(d['x_cal']); tau2 = float(d['y'])
-        if x_cal <= 0 or not np.isfinite(tau2) or tau2 <= 0:
-            continue
-        xs.append(x_cal); ys.append(tau2); layers.append(layer)
-    if not xs:
-        return []
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    denom = max(1, max_layers - 1)
-    for x, y, layer in zip(xs, ys, layers):
-        ax.scatter([x], [y], c=[viridis(layer / denom)], s=26, alpha=0.9)
-    # y=x reference
-    x_max = float(max(np.max(xs), np.max(ys)))
-    xline = np.linspace(0.0, x_max * 1.05, 200)
-    ax.plot(xline, xline, ls='--', lw=1.2, color='black')
+    # Requested: sane, consistent log-x range.
+    ax.set_xlim(1e-4, 1e1)
     return []
 
 def create_singular_gap_vs_sv_loglog_subplot(
@@ -565,14 +561,8 @@ def create_singular_gap_vs_sv_loglog_subplot(
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-
-        sv = d.get("sv")
-        gap = d.get("gap")
-        if sv is None or gap is None:
-            continue
-
-        sv = np.asarray(sv, dtype=float)
-        gap = np.asarray(gap, dtype=float)
+        sv = np.asarray(d["sv"], dtype=float)
+        gap = np.asarray(d["gap"], dtype=float)
 
         if sv.size == 0 or gap.size == 0:
             continue
@@ -608,16 +598,15 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
     ax.set_ylabel(r"$z=\sqrt{d}\cos(\theta)$")
     ax.set_xscale("log")
     ax.set_yscale("log")
+    ax.set_ylim(1e-2, 1e2)
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sv = d.get("sv", None)
-        ang = d.get("angles", None)
-        if sv is None or ang is None:
-            continue
+        sv = d["sv"]
+        ang = d["angles"]
         sv = np.asarray(sv, dtype=float)              # [D]
         ang = np.asarray(ang, dtype=float)            # [R,D]
         if sv.ndim != 1 or ang.ndim != 2:
@@ -633,7 +622,7 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
         # flatten distribution: (R*D,)
         xs = np.repeat(sv, R)
         ys = np.asarray(z, dtype=float).reshape(-1)
-        mask = np.isfinite(xs) & (xs > 0) & np.isfinite(ys)
+        mask = np.isfinite(xs) & (xs > 0) & np.isfinite(ys) & (ys > 0)
         if not np.any(mask):
             continue
         xs = xs[mask]
@@ -678,9 +667,6 @@ def main():
 
         pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
         echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
-        echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
-        kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
-        noise_panel_ts: Dict[int, GPTLayerProperty] = {}
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
         left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
         right_align_panel_ts: Dict[int, GPTLayerProperty] = {}
@@ -688,24 +674,15 @@ def main():
         for step in steps:
             aggregated_payload = load_step_artifacts(run_id, step)
             pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
-            noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
             echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
             right_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="right")
 
-        combined_noise: GPTLayerProperty = {}
-        for panel in noise_panel_ts.values():
-            combined_noise.update(panel)
-        kappa_map = fit_per_type_kappa_loglog(combined_noise)
-        for step, panel in noise_panel_ts.items():
-            kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
-            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(echo_singular_direct_ts[step], panel, kappa_map)
-
         ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
         out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
         return 0
 
     # --- Expensive compute path (distributed) ---
@@ -749,13 +726,11 @@ def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerPro
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props.get('aligned_replicate_singular_values', None)
-        if s_rep is None:
-            s_rep = props['replicate_singular_values']      # torch [B,Kc]
+        s_rep = props['replicate_singular_values']          # torch [B,Kc]
         s_dir = torch.median(s_rep, dim=0).values           # torch [Kc]
         sv = s_dir.detach().cpu().numpy()
         actual = props['spectral_echo'].detach().cpu().numpy()
-        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
+        tau2 = float(props['empirical_phase_constant_tau2'])
         if sv.size and actual.size:
             n = min(sv.size, actual.size)
             sv = sv[:n]; actual = actual[:n]
@@ -773,12 +748,10 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props.get('aligned_replicate_singular_values', None)
-        if s_rep is None:
-            s_rep = props['replicate_singular_values']                     # [B,Kc]
+        s_rep = props['replicate_singular_values']                         # [B,Kc]
         s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
         echo = props['spectral_echo'].detach().cpu().numpy()               # [Kc]
-        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
+        tau2 = float(props['empirical_phase_constant_tau2'])
         n = min(s_dir.size, echo.size)
         if n:
             out[key] = {
@@ -804,9 +777,7 @@ def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerPr
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props.get('aligned_replicate_singular_values', None)
-        if s_rep is None:
-            s_rep = props["replicate_singular_values"]      # [B, Kc]
+        s_rep = props["replicate_singular_values"]          # [B, Kc]
         # Median over replicas, preserve ordering along the singular dimension
         s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
 
@@ -846,10 +817,8 @@ def build_alignment_angle_vs_sv_panel(
     out: GPTLayerProperty = {}
     key_ang = "left_alignment_angles_deg" if which == "left" else "right_alignment_angles_deg"
     for key, props in aggregated_payload.items():
-        s_rep = props.get("replicate_singular_values", None)
-        ang = props.get(key_ang, None)
-        if s_rep is None or ang is None:
-            continue
+        s_rep = props["replicate_singular_values"]
+        ang = props[key_ang]
         # s_rep: [R,D], ang: [R,D]
         if isinstance(s_rep, torch.Tensor):
             s_rep_t = s_rep
@@ -870,86 +839,16 @@ def build_alignment_angle_vs_sv_panel(
     return out
 
 
-def build_noise_to_phase_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
-    out: GPTLayerProperty = {}
-    for key, props in aggregated_payload.items():
-        sigma2 = float(props.get('gradient_noise_sigma2', np.nan))
-        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
-        out[key] = {'sigma2': sigma2, 'tau2': tau2}
-    return out
-
-
-def fit_per_type_kappa_loglog(noise_panel: GPTLayerProperty) -> Dict[str, float]:
-    """Fit per-parameter-type kappa via log-log OLS with slope fixed to 1.
-
-    For each param_type, solve log(tau2) = log(kappa) + log(sigma2) and estimate
-    log(kappa) = mean(log(tau2) - log(sigma2)) across the 16 layers.
-    """
-    kappa_map: Dict[str, float] = {}
-    for param_type in PARAM_TYPES:
-        diffs = []
-        for (pt, _layer), d in noise_panel.items():
-            if pt != param_type or not isinstance(d, dict):
-                continue
-            sigma2 = float(d.get('sigma2', float('nan')))
-            tau2 = float(d.get('tau2', float('nan')))
-            if np.isfinite(sigma2) and np.isfinite(tau2) and sigma2 > 0 and tau2 > 0:
-                diffs.append(np.log(tau2) - np.log(sigma2))
-        kappa_map[param_type] = float(np.exp(np.mean(diffs))) if diffs else float('nan')
-    return kappa_map
-
-
-def build_spectral_echo_vs_sv_panel_from_kappa(direct_panel: GPTLayerProperty,
-                                               noise_panel: GPTLayerProperty,
-                                               kappa_map: Dict[str, float]) -> GPTLayerProperty:
-    """Use existing CPU direct panel (sv, spectral_echo, shape) and noise panel (sigma2) to set tau2 = kappa*sigma2."""
-    out: GPTLayerProperty = {}
-    for key, d in direct_panel.items():
-        param_type, _ = key
-        sv = np.asarray(d.get('sv', []))
-        echo = np.asarray(d.get('spectral_echo', []))
-        shape = tuple(d.get('shape', ()))
-        np_noise = noise_panel.get(key, {}) if isinstance(noise_panel.get(key, None), dict) else {}
-        sigma2 = float(np_noise.get('sigma2', np.nan))
-        kappa = float(kappa_map.get(param_type, np.nan))
-        tau2 = sigma2 * kappa if np.isfinite(sigma2) and np.isfinite(kappa) else np.nan
-        n = min(len(sv), len(echo))
-        if n:
-            out[key] = {
-                'sv': sv[:n],
-                'spectral_echo': echo[:n],
-                'tau2': tau2,
-                'shape': shape,
-            }
-    return out
-
-
-def build_kappa_calibration_panel(noise_panel: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
-    """Transform (sigma2, tau2) into (x_cal = sigma2*kappa, y = tau2) per layer; include kappa for titles."""
-    out: GPTLayerProperty = {}
-    for (pt, layer), d in noise_panel.items():
-        sigma2 = float(d.get('sigma2', np.nan))
-        tau2 = float(d.get('tau2', np.nan))
-        kappa = float(kappa_map.get(pt, np.nan))
-        if np.isfinite(sigma2) and np.isfinite(tau2) and np.isfinite(kappa) and sigma2 > 0 and tau2 > 0 and kappa > 0:
-            out[(pt, layer)] = {'x_cal': sigma2 * kappa, 'y': tau2, 'kappa': kappa}
-    return out
-
-
 def generate_gifs_for_run(
     out_dir: Path,
     pred_ts: Dict[int, GPTLayerProperty],
     echo_ts_direct: Dict[int, GPTLayerProperty],
-    echo_ts_kappa: Dict[int, GPTLayerProperty],
-    kappa_ts: Dict[int, GPTLayerProperty],
     sv_gap_ts: Dict[int, GPTLayerProperty],
     left_align_ts: Dict[int, GPTLayerProperty],
     right_align_ts: Dict[int, GPTLayerProperty],
 ):
     make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spectral_echo_subplot, title="pred_vs_actual_spectral_echo", output_dir=out_dir)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(echo_ts_kappa, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_from_kappa", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(kappa_ts, create_kappa_calibration_subplot, title="kappa_calibration", output_dir=out_dir)
     # Normalized-x spectral-echo plot (using direct tau2 overlays)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_normalized_subplot, title="spectral_echo_vs_singular_values_normalized_direct", output_dir=out_dir)
     make_gif_from_layer_property_time_series(
