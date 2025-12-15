@@ -10,7 +10,7 @@ the "how" (execution), we achieve dramatically improved readability and maintain
 
 Usage:
     # Compute artifacts (expensive)
-    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.run_gradient_analysis medium_full_svd_20251103 --mode render --testing 20 1700
+    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.run_gradient_analysis medium_full_svd_20251103 --mode compute --testing 20 1700
 
     # Render from artifacts (cheap; no torchrun required)
     python -m empirical.research.analysis.run_gradient_analysis medium_full_svd_20251103 --mode render --testing 20 1700
@@ -624,7 +624,7 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
         ys = ys[mask]
 
         color = viridis(layer / denom)
-        ax.scatter(xs, ys, s=6, alpha=0.15, c=[color])
+        ax.scatter(xs, ys, s=6, alpha=1.0 / 510, c=[color])
 
     return []
 
