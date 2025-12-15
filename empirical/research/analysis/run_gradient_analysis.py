@@ -18,12 +18,14 @@ Usage:
 import logging
 import argparse
 from datetime import datetime
+import math
 import os
 import sys
 import re
 from pathlib import Path
 import csv
 import json
+import typing as tp
 from typing import Dict, Tuple, Any
 
 # Memory optimization like training
@@ -79,6 +81,19 @@ def gradients_stable_rank_from_singulars(rep_singulars: torch.Tensor) -> torch.T
         num = torch.sum(s2, dim=1)
         den = torch.max(s2, dim=1).values.clamp_min(1e-20)
         return num / den
+
+
+def _alignment_z_from_angle_deg(angle_deg: tp.Any, d: int) -> np.ndarray:
+    """
+    z := sqrt(d) * cos(theta), with theta provided in degrees.
+    d is taken to be the number of singular values for the layer (min(m, n)).
+    """
+    if isinstance(angle_deg, torch.Tensor):
+        theta = angle_deg.detach().to(dtype=torch.float32) * (math.pi / 180.0)
+        z = math.sqrt(float(d)) * torch.cos(theta)
+        return z.detach().cpu().numpy()
+    theta = np.asarray(angle_deg, dtype=np.float32) * (math.pi / 180.0)
+    return (math.sqrt(float(d)) * np.cos(theta)).astype(np.float32)
 
 
 ANALYSIS_SPECS = [
@@ -590,10 +605,9 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
     title = f"{param_type} ({which})"
     ax.set_title(title)
     ax.set_xlabel("Singular value s (log scale)")
-    ax.set_ylabel("Alignment angle (degrees)")
+    ax.set_ylabel(r"$z=\sqrt{d}\cos(\theta)$")
     ax.set_xscale("log")
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(0.0, 90.0)
 
     denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
@@ -613,10 +627,11 @@ def _create_alignment_angle_vs_sv_semilog_subplot(
             continue
         sv = sv[:D]
         ang = ang[:, :D]
+        z = _alignment_z_from_angle_deg(ang, D)
 
         # flatten distribution: (R*D,)
         xs = np.repeat(sv, R)
-        ys = ang.reshape(-1)
+        ys = np.asarray(z, dtype=float).reshape(-1)
         mask = np.isfinite(xs) & (xs > 0) & np.isfinite(ys)
         if not np.any(mask):
             continue
@@ -942,8 +957,8 @@ def generate_gifs_for_run(
         title="singular_value_gap_vs_singular_value",
         output_dir=out_dir,
     )
-    make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_vs_sv_semilog_subplot, title="left_alignment_angle_vs_singular_value", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_angle_vs_singular_value", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_vs_sv_semilog_subplot, title="left_alignment_z_vs_singular_value", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_z_vs_singular_value", output_dir=out_dir)
 
 if __name__ == "__main__":
     sys.exit(main())
