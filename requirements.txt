@@ -3,3 +3,5 @@ tqdm
 torch
 huggingface-hub
 scipy
+matplotlib
+imageio

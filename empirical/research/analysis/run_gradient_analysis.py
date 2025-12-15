@@ -10,10 +10,10 @@ the "how" (execution), we achieve dramatically improved readability and maintain
 
 Usage:
     # Compute artifacts (expensive)
-    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.run_gradient_analysis <run_id> --mode compute
+    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.run_gradient_analysis medium_full_svd_20251103 --mode render --testing 20 1700
 
     # Render from artifacts (cheap; no torchrun required)
-    python -m empirical.research.analysis.run_gradient_analysis <run_id> --mode render
+    python -m empirical.research.analysis.run_gradient_analysis medium_full_svd_20251103 --mode render --testing 20 1700
 """
 import logging
 import argparse
@@ -276,7 +276,14 @@ def compute_analysis_for_step(
         if completed % LOG_EVERY == 0:
             log_from_rank(f"Analyzed {completed}/{total} layers", rank)
     
+    # Persist shapes for render-only runs (artifacts do NOT store checkpoint weights).
+    layer_shapes = {
+        layer_key: tuple(int(x) for x in props["checkpoint_weights"].shape[-2:])
+        for layer_key, props in initial_props.items()
+    }
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
+    for layer_key, props in local_results.items():
+        props["shape"] = layer_shapes[layer_key]
 
     # Stream results to per-rank CSV to avoid large in-memory payloads
     stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
@@ -352,7 +359,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
-                'shape': json.dumps(list(props.get('shape', props['checkpoint_weights'].shape[-2:]))),
+                'shape': json.dumps(list(props['shape'])),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
             }
@@ -762,7 +769,7 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
                 'sv': s_dir[:n],
                 'spectral_echo': echo[:n],
                 'tau2': tau2,
-                'shape': tuple(int(x) for x in props.get('shape', props['checkpoint_weights'].shape[-2:])),
+                'shape': tuple(int(x) for x in props['shape']),
             }
             # optional shape guards
             assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
@@ -798,7 +805,7 @@ def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerPr
         if n <= 0:
             continue
 
-        shape = tuple(int(x) for x in props.get("shape", props["checkpoint_weights"].shape[-2:]))
+        shape = tuple(int(x) for x in props["shape"])
         out[key] = {
             "sv": sv[:n],               # match gap length
             "gap": gap,
@@ -838,7 +845,7 @@ def build_alignment_angle_vs_sv_panel(
         n = min(s_dir.size, ang_np.shape[1] if ang_np.ndim == 2 else 0)
         if n <= 0:
             continue
-        shape = tuple(int(x) for x in props.get("shape", props["checkpoint_weights"].shape[-2:]))
+        shape = tuple(int(x) for x in props["shape"])
         out[key] = {
             "sv": s_dir[:n],
             "angles": ang_np[:, :n],
