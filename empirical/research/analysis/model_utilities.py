@@ -288,8 +288,8 @@ def get_accumulated_gradient_matrices(
                             # Append all replicas for this accumulation
                             if key not in per_replicate_grads:
                                 per_replicate_grads[key] = []
-                            # Move to CPU for storage to save GPU memory
-                            per_replicate_grads[key].extend([t.cpu() for t in gather_list])
+                            # Keep on GPU; analysis pipeline expects GPU-resident gradients.
+                            per_replicate_grads[key].extend([t.detach() for t in gather_list])
                         else:
                             # Send to owner
                             dist.gather(g, dst=owner)
@@ -297,7 +297,7 @@ def get_accumulated_gradient_matrices(
                         # Single-process fallback: just append local tensor
                         if key not in per_replicate_grads:
                             per_replicate_grads[key] = []
-                        per_replicate_grads[key].append(g.cpu())
+                        per_replicate_grads[key].append(g)
 
                 # Attention split or single matrix
                 if param_type == "Attention" and param.grad.ndim >= 3:
@@ -320,7 +320,7 @@ def get_accumulated_gradient_matrices(
         if not grad_list:
             continue
         # Expect exactly (world_size * num_accumulation_steps) entries per key
-        G = torch.stack(grad_list, dim=0)  # [R,H,W] (on CPU)
+        G = torch.stack(grad_list, dim=0)  # [R,H,W] (on GPU)
         if accum_buffer_map is not None and key in accum_buffer_map and accum_gamma != 0.0:
             B = accum_buffer_map[key]                    # [H,W]
             # Match attention split shapes too (if caller passed Q/K/V/O separately this is already [H,W])

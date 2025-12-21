@@ -416,8 +416,6 @@ def get_mean_svd(mean_gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         U: [H, D], S: [D], V: [W, D], D=min(H,W)
     """
     with torch.no_grad():
-        if mean_gradient.device.type != "cuda":
-            raise RuntimeError(f"Expected mean_gradient on CUDA, got {mean_gradient.device}")
         U, S, Vh = safe_svd(mean_gradient)
         return U, S, Vh.T
 
@@ -495,11 +493,6 @@ def align_svds_greedy_to_mean(
         U_rep, S_rep, V_rep = raw_svds
         U_mean, _S_mean, V_mean = mean_svd
 
-        if U_rep.device.type != "cuda" or V_rep.device.type != "cuda":
-            raise RuntimeError(f"Expected raw_svds on CUDA, got U={U_rep.device}, V={V_rep.device}")
-        if U_mean.device.type != "cuda" or V_mean.device.type != "cuda":
-            raise RuntimeError(f"Expected mean_svd on CUDA, got U={U_mean.device}, V={V_mean.device}")
-
         if U_rep.dtype == torch.bfloat16:
             U_rep = U_rep.float()
         if V_rep.dtype == torch.bfloat16:
@@ -561,8 +554,6 @@ def get_raw_svds(
     where D=min(H,W). Directions are the raw SVD directions of each replicate.
     """
     with torch.no_grad():
-        if empirical_gradients.device.type != "cuda":
-            raise RuntimeError(f"Expected empirical_gradients on CUDA, got {empirical_gradients.device}")
         R, H, W = empirical_gradients.shape
         U_list: list[torch.Tensor] = []
         S_list: list[torch.Tensor] = []

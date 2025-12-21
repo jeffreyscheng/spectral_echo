@@ -241,7 +241,8 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
         else:
             k = None
         if k is not None and buf.ndim >= 2:     # only matrices (hidden weights)
-            buf_by_key[k] = buf.contiguous()    # keep on CPU; shapes [H,W] or [4,H,W] parts handled later
+            # Keep on GPU so analysis compute stays GPU-resident.
+            buf_by_key[k] = buf.contiguous().to(device, non_blocking=True)
 
     # Use a single γ; if multiple groups exist, pick the first (hidden has one group in your setup)
     if 'group_momentum' in opt_meta and opt_meta['group_momentum']:
