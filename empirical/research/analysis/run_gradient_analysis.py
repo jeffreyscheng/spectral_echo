@@ -49,7 +49,6 @@ from empirical.research.analysis.core_math import (
     matrix_shape_beta,
     stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
-    fit_empirical_phase_constant_tau2,
     get_spectral_echoes_from_aligned_svds,
     get_aligned_svds,
     get_mean_svd,
@@ -58,7 +57,6 @@ from empirical.research.analysis.core_math import (
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
     compute_panel_xs,
-    predict_spectral_echo_curve_np,
     newton_schulz_quintic_function,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
@@ -124,6 +122,23 @@ ANALYSIS_SPECS = [
                  ["aligned_replicate_singular_values"],
                  lambda x: x),
 
+    # Per-replicate Frobenius norms ||G_r||_F (needed for sv normalization in render)
+    PropertySpec(
+        "per_replicate_gradient_fro_norm",
+        ["per_replicate_gradient"],
+        lambda g: torch.linalg.vector_norm(
+            g.reshape(g.shape[0], -1),
+            dim=1,
+        ).clamp_min(1e-20),
+    ),
+
+    # Frobenius-normalized singular values: s_{r,i} / ||G_r||_F  (guaranteed <= 1)
+    PropertySpec(
+        "replicate_singular_values_fro_normalized",
+        ["replicate_singular_values", "per_replicate_gradient_fro_norm"],
+        lambda s_rep, fro: s_rep / fro[:, None],
+    ),
+
     # Alignment diagnostics: per-atom angles vs mean-gradient directions
     PropertySpec(
         "left_alignment_angles_deg",
@@ -159,11 +174,6 @@ ANALYSIS_SPECS = [
     PropertySpec("gradient_noise_sigma2",
                  ["per_replicate_gradient", "mean_gradient"],
                  estimate_gradient_noise_sigma2),
-
-    # τ² fit: original singulars + spectral_echo
-    PropertySpec("empirical_phase_constant_tau2",
-                 ["aligned_replicate_singular_values", "spectral_echo"],
-                 fit_empirical_phase_constant_tau2),
 ]
 
 
@@ -372,14 +382,12 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "spectral_echo",
         "shape",
         "gradient_noise_sigma2",
-        "empirical_phase_constant_tau2",
     ]
     f, writer = open_layer_stats_writer(csv_path, fieldnames=csv_fieldnames)
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
             grad_sigma2_val = float(props['gradient_noise_sigma2'])
-            tau2_val = float(props['empirical_phase_constant_tau2'])
 
             row = {
                 'param_type': param_type,
@@ -391,7 +399,6 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['shape'])),
                 'gradient_noise_sigma2': grad_sigma2_val,
-                'empirical_phase_constant_tau2': tau2_val,
             }
             writer.writerow(row)
     finally:
@@ -409,33 +416,6 @@ def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     return [(s, unique[s]) for s in sorted(unique)]
 
 ## removed legacy main; simplified main is defined below
-
-
-
-def create_pred_vs_actual_spectral_echo_subplot(ax, prop: GPTLayerProperty, param_type: str, viridis, max_layers: int):
-    ax.set_title(param_type)
-    ax.set_xlabel('Predicted spectral echo')
-    ax.set_ylabel('Actual spectral echo')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
-    denom = max(1, max_layers - 1)
-    for (pt, layer), arr in sorted(prop.items(), key=lambda x: x[0][1]):
-        if pt != param_type: continue
-        a = np.asarray(arr)
-        if a.ndim != 2 or (a.shape[0] != 2 and a.shape[1] != 2):
-            continue
-        if a.shape[0] == 2:
-            pred, actual = a[0], a[1]
-        else:
-            pred, actual = a[:, 0], a[:, 1]
-        pred = np.clip(pred, 1e-8, 1.0)
-        actual = np.clip(actual, 1e-8, 1.0)
-        color = viridis(layer / denom)
-        ax.scatter(pred, actual, s=6, alpha=0.2, c=[color])
-    # y=x reference
-    xs = np.linspace(0.0, 1.0, 200)
-    ax.plot(xs, xs, ls='--', lw=1.0, color='black')
-    return []
 
 def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
@@ -467,73 +447,40 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
         xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
         y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
         ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
-    # Overlay predicted E[spectral_echo] for each layer using tau2
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
-        tau2 = float(d['tau2'])
-        if not np.isfinite(tau2) or tau2 <= 0:
-            continue
-        color = viridis(layer / denom)
-        y_pred = predict_spectral_echo_curve_np(xs, float(tau2)) if xs.size else np.array([])
-        if y_pred.size:
-            ax.plot(xs, y_pred, color=color, lw=1.0, alpha=0.9)
     return []
 
 
 def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
-    ax.set_title(f"{param_type} (normalized s)")
-    ax.set_xlabel('Normalized singular value s/s_ref (log scale)')
+    ax.set_title(f"{param_type} (Frobenius-normalized s)")
+    ax.set_xlabel(r"Normalized singular value $s/\|G\|_F$ (log scale)")
     ax.set_ylabel('Spectral echo')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
     ax.set_ylim(0.0, 1.0)
-
-    # Robust reference scale per param_type: median of per-layer max(s).
-    smax_list = []
-    for (pt, _layer), d in panel.items():
-        if pt != param_type or not isinstance(d, dict):
-            continue
-        sv0 = np.asarray(d['sv'], dtype=float)
-        if sv0.size == 0:
-            continue
-        smax0 = float(np.max(sv0))
-        if np.isfinite(smax0) and smax0 > 0:
-            smax_list.append(smax0)
-    s_ref = float(np.median(np.asarray(smax_list, dtype=float))) if smax_list else 1.0
-    if not np.isfinite(s_ref) or s_ref <= 0:
-        s_ref = 1.0
 
     denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
         sv = np.asarray(d['sv'], dtype=float)
+        sv_fro = np.asarray(d['sv_fro'], dtype=float)
         echo = np.clip(np.asarray(d['spectral_echo'], dtype=float), 0.0, 1.0)
-        if sv.size == 0 or echo.size == 0:
+        if sv.size == 0 or sv_fro.size == 0 or echo.size == 0:
             continue
-        m = min(sv.size, echo.size)
-        sv = sv[:m]; echo = echo[:m]
-        if not np.all(np.isfinite(sv)):
-            continue
-        # Normalize by shared s_ref so the axis is comparable across layers and can exceed 1.
-        svn = sv / s_ref
+        m = min(sv.size, sv_fro.size, echo.size)
+        sv = sv[:m]
+        sv_fro = sv_fro[:m]
+        echo = echo[:m]
         color = viridis(layer / denom)
-        mask = np.isfinite(svn) & (svn > 0) & np.isfinite(echo)
+        mask = np.isfinite(sv_fro) & (sv_fro > 0) & np.isfinite(echo) & np.isfinite(sv)
         if not np.any(mask):
             continue
-        svn = svn[mask]
-        echo = echo[mask]
-        order = np.argsort(svn)
-        ax.scatter(svn[order], echo[order], s=6, alpha=0.25, c=[color])
-        tau2 = float(d['tau2'])
-        if np.isfinite(tau2) and tau2 > 0:
-            # Prediction is still in terms of *true* singular values (sv), we just display x in normalized units.
-            sv_true = (svn[order] * s_ref).astype(float)
-            y_pred = predict_spectral_echo_curve_np(sv_true, float(tau2))
-            ax.plot(svn[order], y_pred, color=color, lw=1.0, alpha=0.9)
+        x = sv_fro[mask]
+        y = echo[mask]
+        order = np.argsort(x)
+        ax.scatter(x[order], y[order], s=6, alpha=0.25, c=[color])
 
-    # Requested: sane, consistent log-x range.
-    ax.set_xlim(1e-4, 1e1)
+    # Frobenius-normalized singular values satisfy 0 < s/||G||_F <= 1 (up to FP noise).
+    ax.set_xlim(1e-4, 1.05)
     return []
 
 def create_singular_gap_vs_sv_loglog_subplot(
@@ -665,7 +612,6 @@ def main():
         if not steps:
             raise SystemExit(f"No artifacts found for run_id={run_id}. Did you run --mode compute?")
 
-        pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
         echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
         left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
@@ -673,7 +619,6 @@ def main():
 
         for step in steps:
             aggregated_payload = load_step_artifacts(run_id, step)
-            pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
             echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
@@ -682,7 +627,7 @@ def main():
         ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
         out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
+        generate_gifs_for_run(out_dir, echo_singular_direct_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
         return 0
 
     # --- Expensive compute path (distributed) ---
@@ -719,45 +664,25 @@ def main():
     return 0
 
 
-def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
-    """
-    IMPORTANT: Pair per-direction singulars (aggregated across replicas) with per-direction echoes.
-    Avoid flattening [B,Kc] singulars; take median across B to get [Kc].
-    """
-    out: GPTLayerProperty = {}
-    for key, props in aggregated_payload.items():
-        s_rep = props['replicate_singular_values']          # torch [B,Kc]
-        s_dir = torch.median(s_rep, dim=0).values           # torch [Kc]
-        sv = s_dir.detach().cpu().numpy()
-        actual = props['spectral_echo'].detach().cpu().numpy()
-        tau2 = float(props['empirical_phase_constant_tau2'])
-        if sv.size and actual.size:
-            n = min(sv.size, actual.size)
-            sv = sv[:n]; actual = actual[:n]
-            pred = predict_spectral_echo_curve_np(sv, tau2)
-            out[key] = np.vstack([
-                np.clip(pred, 1e-8, 1.0),
-                np.clip(actual, 1e-8, 1.0)
-            ])
-    return out
-
-
 def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     """
     Store per-direction singulars (median across replicas) and matched per-direction echoes.
     """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        s_rep = props['replicate_singular_values']                         # [B,Kc]
-        s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
-        echo = props['spectral_echo'].detach().cpu().numpy()               # [Kc]
-        tau2 = float(props['empirical_phase_constant_tau2'])
-        n = min(s_dir.size, echo.size)
+        s_rep = props['replicate_singular_values']  # [R,D]
+        s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [D]
+
+        s_rep_fro = props['replicate_singular_values_fro_normalized']  # [R,D]
+        s_dir_fro = torch.median(s_rep_fro, dim=0).values.detach().cpu().numpy()  # [D]
+
+        echo = props['spectral_echo'].detach().cpu().numpy()  # [D]
+        n = min(s_dir.size, s_dir_fro.size, echo.size)
         if n:
             out[key] = {
                 'sv': s_dir[:n],
+                'sv_fro': s_dir_fro[:n],
                 'spectral_echo': echo[:n],
-                'tau2': tau2,
                 'shape': tuple(int(x) for x in props['shape']),
             }
             # optional shape guards
@@ -841,13 +766,11 @@ def build_alignment_angle_vs_sv_panel(
 
 def generate_gifs_for_run(
     out_dir: Path,
-    pred_ts: Dict[int, GPTLayerProperty],
     echo_ts_direct: Dict[int, GPTLayerProperty],
     sv_gap_ts: Dict[int, GPTLayerProperty],
     left_align_ts: Dict[int, GPTLayerProperty],
     right_align_ts: Dict[int, GPTLayerProperty],
 ):
-    make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spectral_echo_subplot, title="pred_vs_actual_spectral_echo", output_dir=out_dir)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
     # Normalized-x spectral-echo plot (using direct tau2 overlays)
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_normalized_subplot, title="spectral_echo_vs_singular_values_normalized_direct", output_dir=out_dir)

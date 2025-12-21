@@ -4,6 +4,7 @@ FIELD_NAMES = [
     "weights_stable_rank",
     "gradients_stable_rank",
     "replicate_singular_values",
+    "replicate_singular_values_fro_normalized",
     "left_alignment_angles_deg",
     "right_alignment_angles_deg",
     "spectral_echo",
