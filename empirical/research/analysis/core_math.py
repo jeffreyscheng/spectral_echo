@@ -78,8 +78,7 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
 
     - Promotes bf16 -> f32 for numerical stability.
     - Ensures contiguity for linalg kernels.
-    - JIT offloads CPU tensors to CUDA for compute (if available), then
-      returns results on CPU to keep GPU memory footprint low across layers.
+    - Never moves results to CPU. (If input is CUDA, output stays CUDA.)
     """
     with torch.no_grad():
         x = tensor
@@ -87,17 +86,7 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
             x = x.float()
         x = x.contiguous()
 
-        need_offload = (x.device.type != 'cuda') and torch.cuda.is_available()
-        if need_offload:
-            x = x.cuda(non_blocking=True)
-
         U, s, Vh = torch.linalg.svd(x, full_matrices=False)
-
-        # Move back to CPU if we offloaded to keep memory steady over many layers
-        if need_offload:
-            U = U.cpu()
-            s = s.cpu()
-            Vh = Vh.cpu()
         return U, s, Vh
 
 
@@ -113,14 +102,23 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
 
 # Convenience functions for common operations
 def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
-    """Compute stable rank directly from a matrix (computes SVD internally)."""
+    """
+    Compute stable rank directly from a matrix (computes SVD internally).
+
+    IMPORTANT: Avoid material CPU transfers in the analysis compute pipeline.
+    For torch inputs, returns a 0-dim torch scalar (on the input device).
+    """
     if isinstance(tensor, torch.Tensor):
         with torch.no_grad():
-            # Cast to float32 if needed for SVD compatibility
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.float()
             s = torch.linalg.svdvals(tensor)
-            return compute_stable_rank(s)
+            s2 = s * s
+            smax2 = s2.max().clamp_min(1e-20)
+            # ignore tiny singular values to reduce numerical-noise sensitivity
+            mask = (s > 1e-8).to(dtype=s.dtype)
+            num = (s2 * mask).sum()
+            return (num / smax2)
     else:
         s = np.linalg.svd(tensor, compute_uv=False)
         return compute_stable_rank(s)
@@ -144,7 +142,8 @@ def estimate_gradient_noise_sigma2(
         # Frobenius norm squared per replicate, then sum over replicates
         frob2_per_rep = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
         total_frob2 = torch.sum(frob2_per_rep)
-        return float(total_frob2 / max(1, (B - 1) * m * n))
+        denom = max(1, (B - 1) * m * n)
+        return total_frob2 / denom
 
 def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
     log_s = np.log(s)
@@ -417,6 +416,8 @@ def get_mean_svd(mean_gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         U: [H, D], S: [D], V: [W, D], D=min(H,W)
     """
     with torch.no_grad():
+        if mean_gradient.device.type != "cuda":
+            raise RuntimeError(f"Expected mean_gradient on CUDA, got {mean_gradient.device}")
         U, S, Vh = safe_svd(mean_gradient)
         return U, S, Vh.T
 
@@ -458,11 +459,100 @@ def compute_alignment_angles_deg(
         return left_angles, right_angles
 
 
-def get_aligned_svds(
+def _greedy_perm_from_scores(scores: torch.Tensor) -> torch.Tensor:
+    """
+    Greedy one-to-one assignment done entirely in torch.
+
+    scores: [D, D] where scores[i, j] = affinity between replica atom i and reference atom j.
+    Returns:
+        perm: LongTensor [D] mapping reference index j -> chosen replica index i.
+    """
+    with torch.no_grad():
+        assert scores.ndim == 2 and scores.shape[0] == scores.shape[1]
+        D = int(scores.shape[0])
+        used = torch.zeros(D, dtype=torch.bool, device=scores.device)
+        perm = torch.empty(D, dtype=torch.long, device=scores.device)
+        neg_inf = torch.tensor(float("-inf"), device=scores.device, dtype=scores.dtype)
+        for j in range(D):
+            col = scores[:, j].masked_fill(used, neg_inf)
+            i = torch.argmax(col)
+            perm[j] = i
+            used[i] = True
+        return perm
+
+
+def align_svds_greedy_to_mean(
+    raw_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mean_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Align per-replica SVD atoms to the mean-gradient SVD as reference using a greedy
+    permutation and sign-fix. Intentionally ignores degenerate subspaces / blocks.
+
+    This function is written to avoid any `.cpu()` transfers during pipeline compute.
+    """
+    with torch.no_grad():
+        U_rep, S_rep, V_rep = raw_svds
+        U_mean, _S_mean, V_mean = mean_svd
+
+        if U_rep.device.type != "cuda" or V_rep.device.type != "cuda":
+            raise RuntimeError(f"Expected raw_svds on CUDA, got U={U_rep.device}, V={V_rep.device}")
+        if U_mean.device.type != "cuda" or V_mean.device.type != "cuda":
+            raise RuntimeError(f"Expected mean_svd on CUDA, got U={U_mean.device}, V={V_mean.device}")
+
+        if U_rep.dtype == torch.bfloat16:
+            U_rep = U_rep.float()
+        if V_rep.dtype == torch.bfloat16:
+            V_rep = V_rep.float()
+        if U_mean.dtype == torch.bfloat16:
+            U_mean = U_mean.float()
+        if V_mean.dtype == torch.bfloat16:
+            V_mean = V_mean.float()
+
+        R, H, D = U_rep.shape
+        _, W, Dv = V_rep.shape
+        assert D == Dv, "U/V D mismatch"
+        assert U_mean.shape == (H, D), f"U_mean shape {U_mean.shape} != ({H},{D})"
+        assert V_mean.shape == (W, D), f"V_mean shape {V_mean.shape} != ({W},{D})"
+
+        U_out = torch.empty_like(U_rep)
+        S_out = torch.empty_like(S_rep)
+        V_out = torch.empty_like(V_rep)
+
+        for r in range(R):
+            Ur = U_rep[r]  # [H,D]
+            Vr = V_rep[r]  # [W,D]
+            Sr = S_rep[r]  # [D]
+
+            MU = (Ur.transpose(0, 1) @ U_mean).abs()  # [D,D]
+            MV = (Vr.transpose(0, 1) @ V_mean).abs()  # [D,D]
+            M = (MU * MV).to(dtype=torch.float32)
+
+            perm = _greedy_perm_from_scores(M)  # [D]
+
+            Urp = Ur.index_select(dim=1, index=perm)
+            Vrp = Vr.index_select(dim=1, index=perm)
+            Srp = Sr.index_select(dim=0, index=perm)
+
+            dot_u = (Urp * U_mean).sum(dim=0)
+            dot_v = (Vrp * V_mean).sum(dim=0)
+            t = torch.sign(dot_u * dot_v)
+            t = torch.where(t == 0, torch.ones_like(t), t)
+            Urp = Urp * t.unsqueeze(0)
+            Vrp = Vrp * t.unsqueeze(0)
+
+            U_out[r] = Urp.to(dtype=U_out.dtype)
+            V_out[r] = Vrp.to(dtype=V_out.dtype)
+            S_out[r] = Srp.to(dtype=S_out.dtype)
+
+        return U_out, S_out, V_out
+
+
+def get_raw_svds(
     empirical_gradients: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Per-replicate SVDs with *no* alignment / clustering / merging.
+    Per-replica SVDs with no alignment / clustering / merging.
 
     Returns:
         U: (R, H, D)
@@ -471,6 +561,8 @@ def get_aligned_svds(
     where D=min(H,W). Directions are the raw SVD directions of each replicate.
     """
     with torch.no_grad():
+        if empirical_gradients.device.type != "cuda":
+            raise RuntimeError(f"Expected empirical_gradients on CUDA, got {empirical_gradients.device}")
         R, H, W = empirical_gradients.shape
         U_list: list[torch.Tensor] = []
         S_list: list[torch.Tensor] = []
@@ -484,6 +576,10 @@ def get_aligned_svds(
         S_rep = torch.stack(S_list, dim=0)  # (R,D)
         V_rep = torch.stack(V_list, dim=0)  # (R,W,D)
         return U_rep, S_rep, V_rep
+
+
+# Backward-compat alias for older call sites.
+get_aligned_svds = get_raw_svds
 
 
 def compute_kron_whitening_factors_from_residuals(

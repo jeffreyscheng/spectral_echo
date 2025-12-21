@@ -50,9 +50,10 @@ from empirical.research.analysis.core_math import (
     stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
     get_spectral_echoes_from_aligned_svds,
-    get_aligned_svds,
+    get_raw_svds,
     get_mean_svd,
     compute_alignment_angles_deg,
+    align_svds_greedy_to_mean,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -110,8 +111,13 @@ ANALYSIS_SPECS = [
         lambda grads, mean: grads - mean.unsqueeze(0),
     ),
 
-    # Per-replicate SVDs (NO alignment / clustering / merges)
-    PropertySpec("aligned_svds", ["per_replicate_gradient"], get_aligned_svds),  # (U,S,V) raw
+    # Per-replicate SVDs (raw) + greedy permutation alignment to mean-gradient SVD
+    PropertySpec("raw_svds", ["per_replicate_gradient"], get_raw_svds),  # (U,S,V) raw
+    PropertySpec(
+        "aligned_svds",
+        ["raw_svds", "mean_svd"],
+        align_svds_greedy_to_mean,  # permute + sign-fix, ignores degeneracy blocks
+    ),
     PropertySpec(
         "aligned_replicate_singular_values",
         ["aligned_svds"],
@@ -340,6 +346,11 @@ def to_np16(x):
         return x.detach().to(torch.float16).cpu().numpy()
     return np.asarray(x)
 
+def _to_float_scalar(x: Any) -> float:
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().float().cpu())
+    return float(x)
+
 
 def open_layer_stats_writer(csv_path: Path, fieldnames: list[str]) -> tuple[Any, csv.DictWriter]:
     """Ensure CSV exists with matching header; return (file_handle, writer)."""
@@ -387,12 +398,12 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
-            grad_sigma2_val = float(props['gradient_noise_sigma2'])
+            grad_sigma2_val = _to_float_scalar(props['gradient_noise_sigma2'])
 
             row = {
                 'param_type': param_type,
                 'layer_num': layer_num,
-                'weight_stable_rank': float(props['weights_stable_rank']),
+                'weight_stable_rank': _to_float_scalar(props['weights_stable_rank']),
                 'per_replicate_gradient_singular_values': json.dumps(to_np16(props['replicate_singular_values']).tolist()),
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
