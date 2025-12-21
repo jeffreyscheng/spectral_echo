@@ -453,11 +453,9 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
         ax.scatter(sv[order], echo[order], s=6, alpha=0.25, c=[color])
     # Common x-grid across panel
     xs = compute_panel_xs(panel)
-    xs_max = float(np.max(xs)) if xs.size else 1.0
     # Overlay NS quintic in black (normalized xs)
     if xs.size:
-        xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
-        y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
+        y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
         ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
     return []
 
@@ -490,6 +488,12 @@ def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerPro
         y = echo[mask]
         order = np.argsort(x)
         ax.scatter(x[order], y[order], s=6, alpha=0.25, c=[color])
+    xs = compute_panel_xs(panel)
+    xs_max = float(np.max(xs)) if xs.size else 1.0
+    if xs.size:
+        xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
+        y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
+        ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
 
     # Frobenius-normalized singular values satisfy 0 < s/||G||_F <= 1 (up to FP noise).
     ax.set_xlim(1e-4, 1.05)
