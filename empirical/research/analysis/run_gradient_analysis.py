@@ -275,7 +275,7 @@ def compute_analysis_for_step(
     specs: list[PropertySpec] | None = None,
     run_id: str | None = None,
     opt_meta: Dict[str, Any] | None = None,
-) -> GPTLayerProperty:
+) -> None:
     """Core analysis function - clean and focused."""
     
     # 1. Build initial properties (either provided for mock, or computed from model)
@@ -339,7 +339,7 @@ def compute_analysis_for_step(
     if dist.is_initialized():
         dist.barrier()
     log_from_rank(f"Step {step}: Analysis complete (streamed to CSV)", rank)
-    return local_results
+    return None
 
 
 def to_np16(x):
@@ -660,7 +660,7 @@ def main():
 
     for step, ckpt in checkpoints:
         step_loaded, opt_meta = load_weights_into_model(ckpt, model, device)
-        _local_payload = compute_analysis_for_step(
+        compute_analysis_for_step(
             step_loaded,
             num_accumulation_steps=NUM_ACCUMULATION_STEPS,
             rank=rank,
