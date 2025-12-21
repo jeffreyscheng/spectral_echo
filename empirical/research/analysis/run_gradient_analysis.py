@@ -488,15 +488,13 @@ def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerPro
         y = echo[mask]
         order = np.argsort(x)
         ax.scatter(x[order], y[order], s=6, alpha=0.25, c=[color])
-    xs = compute_panel_xs(panel)
-    xs_max = float(np.max(xs)) if xs.size else 1.0
+    xs = compute_panel_xs(panel, key="sv_fro")
     if xs.size:
-        xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
-        y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
-        ax.plot(xnorm, y_ns, color='black', lw=1.2, alpha=0.9)
+        y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
+        ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
 
     # Frobenius-normalized singular values satisfy 0 < s/||G||_F <= 1 (up to FP noise).
-    ax.set_xlim(1e-4, 1.05)
+    ax.set_xlim(1e-4, 1.0)
     return []
 
 def create_singular_gap_vs_sv_loglog_subplot(
@@ -603,6 +601,62 @@ def create_left_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, vir
 
 def create_right_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers: int):
     return _create_alignment_angle_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers, which="right")
+
+
+def _create_alignment_angle_deg_vs_sv_semilog_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+    which: str,  # "left" | "right"
+):
+    title = f"{param_type} ({which})"
+    ax.set_title(title)
+    ax.set_xlabel("Singular value s (log scale)")
+    ax.set_ylabel(r"Alignment angle $\theta$ (deg)")
+    ax.set_xscale("log")
+    ax.set_ylim(0.0, 180.0)
+    ax.grid(True, alpha=0.3)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        sv = d["sv"]
+        ang = d["angles"]
+        sv = np.asarray(sv, dtype=float)              # [D]
+        ang = np.asarray(ang, dtype=float)            # [R,D] degrees
+        if sv.ndim != 1 or ang.ndim != 2:
+            continue
+        R = ang.shape[0]
+        D = min(sv.size, ang.shape[1])
+        if D <= 0:
+            continue
+        sv = sv[:D]
+        ang = ang[:, :D]
+
+        xs = np.repeat(sv, R)
+        ys = ang.reshape(-1)
+        ys = np.clip(ys, 0.0, 180.0)
+        mask = np.isfinite(xs) & (xs > 0) & np.isfinite(ys)
+        if not np.any(mask):
+            continue
+        xs = xs[mask]
+        ys = ys[mask]
+
+        color = viridis(layer / denom)
+        ax.scatter(xs, ys, s=6, alpha=1.0 / 510, c=[color])
+
+    return []
+
+
+def create_left_alignment_angle_deg_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_alignment_angle_deg_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers, which="left")
+
+
+def create_right_alignment_angle_deg_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_alignment_angle_deg_vs_sv_semilog_subplot(ax, panel, param_type, viridis, max_layers, which="right")
 
 
 
@@ -798,6 +852,8 @@ def generate_gifs_for_run(
     )
     make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_vs_sv_semilog_subplot, title="left_alignment_z_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_z_vs_singular_value", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_deg_vs_sv_semilog_subplot, title="left_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_deg_vs_sv_semilog_subplot, title="right_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
 
 if __name__ == "__main__":
     sys.exit(main())

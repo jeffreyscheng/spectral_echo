@@ -102,22 +102,22 @@ def predict_spectral_echo_curve_np(s: np.ndarray, tau2: float) -> np.ndarray:
     return 1.0 / (1.0 + (tau2 / s2))
 
 
-def compute_panel_xs(panel: GPTLayerProperty, eps: float = 1e-8) -> np.ndarray:
-    """Build a log-spaced x-grid from positive singulars across panel layers."""
+def compute_panel_xs(panel: GPTLayerProperty, key: str = "sv", eps: float = 1e-8) -> np.ndarray:
+    """Build a log-spaced x-grid from positive values across panel layers."""
     vals = []
     for (_pt, _layer), d in panel.items():
-        sv = d.get('sv') if isinstance(d, dict) else None
-        if sv is None:
+        x = d.get(key) if isinstance(d, dict) else None
+        if x is None:
             continue
-        sv = np.asarray(sv, dtype=float)
-        sv = sv[np.isfinite(sv) & (sv > 0)]
-        if sv.size:
-            vals.append(sv)
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x) & (x > 0)]
+        if x.size:
+            vals.append(x)
     if not vals:
         return np.geomspace(1e-6, 1.0, 256)
-    all_sv = np.concatenate(vals)
-    lo = max(float(all_sv.min()), eps)
-    hi = float(all_sv.max())
+    all_x = np.concatenate(vals)
+    lo = max(float(all_x.min()), eps)
+    hi = float(all_x.max())
     if hi <= lo:
         hi = lo * 10.0
     return np.geomspace(lo, hi, 256)
