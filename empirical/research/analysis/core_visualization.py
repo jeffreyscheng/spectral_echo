@@ -103,6 +103,118 @@ def predict_spectral_echo_curve_np(s: np.ndarray, tau2: float) -> np.ndarray:
     return 1.0 / (1.0 + (tau2 / s2))
 
 
+def create_reverb_fit_relative_residual_vs_echo_loglog_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+):
+    """
+    Scatter: x = fitted echo (median across replicas), y = relative residual (dimensionless).
+    Both axes are log-scaled.
+    """
+    ax.set_title(param_type)
+    ax.set_xlabel(r"Fitted echo $\hat{\zeta}$ (log scale)")
+    ax.set_ylabel(r"Relative squared residual (dimensionless)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        x = np.asarray(d.get("echo", []), dtype=float)
+        y = np.asarray(d.get("rel_resid", []), dtype=float)
+        if x.size == 0 or y.size == 0:
+            continue
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+        m = np.isfinite(x) & (x > 0) & np.isfinite(y) & (y > 0)
+        if not np.any(m):
+            continue
+        color = viridis(layer / denom)
+        ax.scatter(x[m], y[m], s=6, alpha=0.25, c=[color])
+
+    return []
+
+
+def create_reverb_fit_stratified_relative_residual_by_denominator_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+):
+    """
+    Line: x = |Z_ab| bin center, y = in-bin mean relative residual.
+    """
+    ax.set_title(param_type)
+    ax.set_xlabel(r"Denominator magnitude $|Z_{ab}|$ (log scale)")
+    ax.set_ylabel(r"Mean relative residual (dimensionless)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        x = np.asarray(d.get("bin_x", []), dtype=float)
+        y = np.asarray(d.get("bin_y", []), dtype=float)
+        if x.size == 0 or y.size == 0:
+            continue
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+        m = np.isfinite(x) & (x > 0) & np.isfinite(y) & (y > 0)
+        if not np.any(m):
+            continue
+        color = viridis(layer / denom)
+        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, color=color)
+
+    return []
+
+
+def create_reverb_fit_stratified_relative_residual_by_numerator_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+):
+    """
+    Line: x = |Z_ap Z_bp| bin center, y = in-bin mean relative residual.
+    """
+    ax.set_title(param_type)
+    ax.set_xlabel(r"Numerator magnitude $|Z_{ap} Z_{bp}|$ (log scale)")
+    ax.set_ylabel(r"Mean relative residual (dimensionless)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        x = np.asarray(d.get("bin_x", []), dtype=float)
+        y = np.asarray(d.get("bin_y", []), dtype=float)
+        if x.size == 0 or y.size == 0:
+            continue
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+        m = np.isfinite(x) & (x > 0) & np.isfinite(y) & (y > 0)
+        if not np.any(m):
+            continue
+        color = viridis(layer / denom)
+        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, color=color)
+
+    return []
+
+
 def compute_panel_xs(panel: GPTLayerProperty, key: str = "sv", eps: float = 1e-8) -> np.ndarray:
     """Build a log-spaced x-grid from positive values across panel layers."""
     vals = []

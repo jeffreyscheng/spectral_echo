@@ -52,6 +52,7 @@ from empirical.research.analysis.core_math import (
     stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
     compute_echo_fit_diagnostics_from_aligned_svds,
+    compute_reverb_fit_relative_diagnostics,
     get_raw_svds,
     get_mean_svd,
     compute_alignment_angles_deg,
@@ -61,6 +62,9 @@ from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
     compute_panel_xs,
     newton_schulz_quintic_function,
+    create_reverb_fit_relative_residual_vs_echo_loglog_subplot,
+    create_reverb_fit_stratified_relative_residual_by_numerator_subplot,
+    create_reverb_fit_stratified_relative_residual_by_denominator_subplot,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
 from empirical.research.analysis.constants import (
@@ -171,6 +175,18 @@ ANALYSIS_SPECS = [
     PropertySpec("triple_mse_bins", ["echo_fit_diagnostics"], lambda d: d["triple_mse_bins"]),
     PropertySpec("triple_mse_by_denom_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_denom_bin"]),
     PropertySpec("triple_mse_by_numer_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_numer_bin"]),
+
+    # Reverb-fit diagnostics (relative-error versions)
+    PropertySpec(
+        "reverb_fit_relative_diagnostics",
+        ["aligned_svds", "spectral_echo_replicates"],
+        compute_reverb_fit_relative_diagnostics,  # (rel_by_echo, denom_x, denom_y, numer_x, numer_y)
+    ),
+    PropertySpec("reverb_fit_rel_residual_by_echo", ["reverb_fit_relative_diagnostics"], lambda t: t[0]),
+    PropertySpec("reverb_fit_denom_bin_centers", ["reverb_fit_relative_diagnostics"], lambda t: t[1]),
+    PropertySpec("reverb_fit_denom_rel_residual", ["reverb_fit_relative_diagnostics"], lambda t: t[2]),
+    PropertySpec("reverb_fit_numer_bin_centers", ["reverb_fit_relative_diagnostics"], lambda t: t[3]),
+    PropertySpec("reverb_fit_numer_rel_residual", ["reverb_fit_relative_diagnostics"], lambda t: t[4]),
 
     # Per-replica gradient stable ranks from singulars (original SVDs)
     PropertySpec("gradients_stable_rank",
@@ -693,9 +709,9 @@ def main():
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
         left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
         right_align_panel_ts: Dict[int, GPTLayerProperty] = {}
-        echo_fit_residual_ts: Dict[int, GPTLayerProperty] = {}
-        triple_respect_denom_ts: Dict[int, GPTLayerProperty] = {}
-        triple_respect_numer_ts: Dict[int, GPTLayerProperty] = {}
+        reverb_relres_ts: Dict[int, GPTLayerProperty] = {}
+        reverb_numer_ts: Dict[int, GPTLayerProperty] = {}
+        reverb_denom_ts: Dict[int, GPTLayerProperty] = {}
 
         for step in steps:
             aggregated_payload = load_step_artifacts(run_id, step)
@@ -703,9 +719,9 @@ def main():
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
             right_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="right")
-            echo_fit_residual_ts[step] = build_echo_fit_weighted_residual_panel(aggregated_payload)
-            triple_respect_denom_ts[step] = build_triple_respect_panel(aggregated_payload, which="denom")
-            triple_respect_numer_ts[step] = build_triple_respect_panel(aggregated_payload, which="numer")
+            reverb_relres_ts[step] = build_reverb_fit_relative_residual_panel(aggregated_payload)
+            reverb_numer_ts[step] = build_reverb_fit_numerator_stratified_panel(aggregated_payload)
+            reverb_denom_ts[step] = build_reverb_fit_denominator_stratified_panel(aggregated_payload)
 
         ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
         out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
@@ -716,9 +732,9 @@ def main():
             sv_gap_ts,
             left_align_panel_ts,
             right_align_panel_ts,
-            echo_fit_residual_ts,
-            triple_respect_denom_ts,
-            triple_respect_numer_ts,
+            reverb_relres_ts,
+            reverb_numer_ts,
+            reverb_denom_ts,
         )
         return 0
 
@@ -977,15 +993,90 @@ def build_alignment_angle_vs_sv_panel(
     return out
 
 
+def build_reverb_fit_relative_residual_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Panel payload:
+      - echo: per-direction fitted echo (median across replicas) [D]
+      - rel_resid: per-direction relative residual (median across pivots) [D]
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        echo = props.get("spectral_echo", None)
+        rr = props.get("reverb_fit_rel_residual_by_echo", None)
+        if echo is None or rr is None:
+            continue
+        echo_np = echo.detach().cpu().numpy() if isinstance(echo, torch.Tensor) else np.asarray(echo)
+        rr_np = rr.detach().cpu().numpy() if isinstance(rr, torch.Tensor) else np.asarray(rr)
+        n = min(int(echo_np.size), int(rr_np.size))
+        if n <= 0:
+            continue
+        out[key] = {
+            "echo": np.clip(echo_np[:n].astype(float), 1e-12, 1.0),
+            "rel_resid": np.clip(rr_np[:n].astype(float), 1e-30, np.inf),
+            "shape": tuple(int(x) for x in props["shape"]),
+        }
+    return out
+
+
+def build_reverb_fit_denominator_stratified_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Panel payload:
+      - bin_x: denominator magnitude bin centers |Z_ab| [B]
+      - bin_y: relative residual aggregated in-bin [B]
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        x = props.get("reverb_fit_denom_bin_centers", None)
+        y = props.get("reverb_fit_denom_rel_residual", None)
+        if x is None or y is None:
+            continue
+        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+        y_np = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
+        n = min(int(x_np.size), int(y_np.size))
+        if n <= 0:
+            continue
+        out[key] = {
+            "bin_x": np.clip(x_np[:n].astype(float), 1e-12, 1.0),
+            "bin_y": np.clip(y_np[:n].astype(float), 1e-30, np.inf),
+            "shape": tuple(int(x) for x in props["shape"]),
+        }
+    return out
+
+
+def build_reverb_fit_numerator_stratified_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Panel payload:
+      - bin_x: numerator magnitude bin centers |Z_ap Z_bp| [B]
+      - bin_y: relative residual aggregated in-bin [B]
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        x = props.get("reverb_fit_numer_bin_centers", None)
+        y = props.get("reverb_fit_numer_rel_residual", None)
+        if x is None or y is None:
+            continue
+        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+        y_np = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
+        n = min(int(x_np.size), int(y_np.size))
+        if n <= 0:
+            continue
+        out[key] = {
+            "bin_x": np.clip(x_np[:n].astype(float), 1e-12, 1.0),
+            "bin_y": np.clip(y_np[:n].astype(float), 1e-30, np.inf),
+            "shape": tuple(int(x) for x in props["shape"]),
+        }
+    return out
+
+
 def generate_gifs_for_run(
     out_dir: Path,
     echo_ts_direct: Dict[int, GPTLayerProperty],
     sv_gap_ts: Dict[int, GPTLayerProperty],
     left_align_ts: Dict[int, GPTLayerProperty],
     right_align_ts: Dict[int, GPTLayerProperty],
-    echo_fit_residual_ts: Dict[int, GPTLayerProperty],
-    triple_respect_denom_ts: Dict[int, GPTLayerProperty],
-    triple_respect_numer_ts: Dict[int, GPTLayerProperty],
+    reverb_relres_ts: Dict[int, GPTLayerProperty],
+    reverb_numer_ts: Dict[int, GPTLayerProperty],
+    reverb_denom_ts: Dict[int, GPTLayerProperty],
 ):
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
     # Normalized-x spectral-echo plot (using direct tau2 overlays)
@@ -1001,23 +1092,23 @@ def generate_gifs_for_run(
     make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_deg_vs_sv_semilog_subplot, title="left_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_deg_vs_sv_semilog_subplot, title="right_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
 
-    # Echo-fit diagnostics:
+    # Reverb-fit diagnostics (relative-error y-axes):
     make_gif_from_layer_property_time_series(
-        echo_fit_residual_ts,
-        create_echo_fit_weighted_residuals_loglog_subplot,
-        title="echo_fit_weighted_residuals_vs_fitted_echo",
+        reverb_relres_ts,
+        create_reverb_fit_relative_residual_vs_echo_loglog_subplot,
+        title="reverb_fit_relative_residual_vs_echo",
         output_dir=out_dir,
     )
     make_gif_from_layer_property_time_series(
-        triple_respect_denom_ts,
-        create_triple_respect_denom_loglog_subplot,
-        title="triple_respect_weighted_mse_vs_denom_reverb",
+        reverb_numer_ts,
+        create_reverb_fit_stratified_relative_residual_by_numerator_subplot,
+        title="reverb_fit_stratified_relative_residual_by_numerator",
         output_dir=out_dir,
     )
     make_gif_from_layer_property_time_series(
-        triple_respect_numer_ts,
-        create_triple_respect_numer_loglog_subplot,
-        title="triple_respect_weighted_mse_vs_numer_reverb",
+        reverb_denom_ts,
+        create_reverb_fit_stratified_relative_residual_by_denominator_subplot,
+        title="reverb_fit_stratified_relative_residual_by_denominator",
         output_dir=out_dir,
     )
 

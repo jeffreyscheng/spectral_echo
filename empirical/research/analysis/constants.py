@@ -19,6 +19,12 @@ FIELD_NAMES = [
     "triple_mse_bins",
     "triple_mse_by_denom_bin",
     "triple_mse_by_numer_bin",
+    # Reverb-fit diagnostics (relative-error versions)
+    "reverb_fit_rel_residual_by_echo",
+    "reverb_fit_denom_bin_centers",
+    "reverb_fit_denom_rel_residual",
+    "reverb_fit_numer_bin_centers",
+    "reverb_fit_numer_rel_residual",
     "empirical_phase_constant_tau2",
     "gradient_noise_sigma2",
     "aspect_ratio_beta",

@@ -410,6 +410,178 @@ def get_spectral_echoes_from_aligned_svds(
         return echoes_zeta
 
 
+def compute_reverb_fit_relative_diagnostics(
+    aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    spectral_echo_replicates: torch.Tensor,  # [R, D] (zeta per replica, per direction)
+    *,
+    num_bins: int = 32,
+    max_directions_for_binning: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute *relative* fit diagnostics for the reverb->echo least-squares surrogate.
+
+    Outputs are designed for lightweight serialization and render-only plotting:
+      1) rel_residual_by_echo: [D]
+         For each singular direction k, we compute a pivotwise relative residual
+             rel(p,k) := Var_w(r_{ab->p,k}) / (mean_w(r_{ab->p,k})^2 + eps)
+         where r_{ab->p,k} are the triple ratios and w = Z_ab^2 (as in the weighted LS).
+         We then aggregate across pivots p by median.
+
+      2) denom_bin_centers: [B], denom_rel_residual: [B]
+         Stratified *pair-averaged* relative residual vs |Z_ab| (denominator magnitude).
+
+      3) numer_bin_centers: [B], numer_rel_residual: [B]
+         Stratified relative residual vs |Z_ap Z_bp| (numerator magnitude), aggregated over pivots.
+
+    Notes:
+    - This uses only aligned bases and the already-computed per-replica echoes.
+    - The bin-stratified curves are computed over a subsample of directions (default 64)
+      to keep compute overhead controlled.
+    """
+    with torch.no_grad():
+        U_rep, _S_rep, V_rep = aligned_svds  # U:[R,H,D], V:[R,W,D]
+        if U_rep.dtype == torch.bfloat16:
+            U_rep = U_rep.float()
+        if V_rep.dtype == torch.bfloat16:
+            V_rep = V_rep.float()
+        zeta = spectral_echo_replicates
+        if zeta.dtype == torch.bfloat16:
+            zeta = zeta.float()
+
+        R, _H, D = U_rep.shape
+        eps = torch.finfo(U_rep.dtype).eps
+
+        # Build reverb tensor Z[d,a,b] = <u_a,u_b><v_a,v_b>, with diag zero.
+        U_stacked = U_rep.permute(2, 0, 1)  # (D,R,H)
+        V_stacked = V_rep.permute(2, 0, 1)  # (D,R,W)
+        gram_U = torch.einsum('dri,dsi->drs', U_stacked, U_stacked)  # (D,R,R)
+        gram_V = torch.einsum('dri,dsi->drs', V_stacked, V_stacked)  # (D,R,R)
+        Z = gram_U * gram_V  # (D,R,R)
+        eye = torch.eye(R, device=Z.device, dtype=torch.bool).unsqueeze(0)  # (1,R,R)
+        Z = Z.masked_fill(eye, 0.0)
+
+        # ---------- 1) Per-direction relative residual vs fitted echo ----------
+        # s_hat[p,k] is the LS estimate of zeta^2 (same object fitted by triple-OLS)
+        s_hat = (zeta * zeta).transpose(0, 1).contiguous()  # (D,R)
+
+        Z2 = Z * Z  # (D,R,R)
+        S0 = Z2.sum(dim=(1, 2)).clamp_min(eps)  # (D,)
+        t = Z2.sum(dim=1)  # (D,R)  (sum over a)
+
+        # Weighted second moment of r under w=Z_ab^2:
+        #   sum_{a,b} w r^2 = sum_{a,b} Z_ap^2 Z_bp^2 = (sum_a Z_ap^2)^2 = t^2
+        Ew_r2 = (t * t) / S0.unsqueeze(1)  # (D,R)
+        var_w = (Ew_r2 - (s_hat * s_hat)).clamp_min(0.0)  # (D,R)
+        rel = var_w / (s_hat * s_hat + eps)  # (D,R)
+        rel_residual_by_echo = torch.median(rel, dim=1).values  # (D,)
+
+        # ---------- 2/3) Bin-stratified relative residuals ----------
+        K = min(int(max_directions_for_binning), int(D))
+        if K <= 0:
+            denom_bin_centers = torch.empty((0,), device=Z.device, dtype=Z.dtype)
+            denom_rel_residual = torch.empty((0,), device=Z.device, dtype=Z.dtype)
+            numer_bin_centers = torch.empty((0,), device=Z.device, dtype=Z.dtype)
+            numer_rel_residual = torch.empty((0,), device=Z.device, dtype=Z.dtype)
+            return rel_residual_by_echo, denom_bin_centers, denom_rel_residual, numer_bin_centers, numer_rel_residual
+
+        dir_idx = torch.linspace(0, D - 1, steps=K, device=Z.device).round().long().unique()
+        K = int(dir_idx.numel())
+
+        def _offdiag_mask(R_: int, device) -> torch.Tensor:
+            return ~torch.eye(R_, device=device, dtype=torch.bool)
+
+        off = _offdiag_mask(R, Z.device)
+
+        denom_mag = Z[dir_idx][:, off].abs()
+        denom_mag = denom_mag[denom_mag > 0]
+        denom_lo = float(torch.quantile(denom_mag, 0.01).clamp_min(1e-8).item()) if denom_mag.numel() else 1e-8
+        denom_hi = float(torch.quantile(denom_mag, 0.99).clamp_min(denom_lo * 10.0).item()) if denom_mag.numel() else 1.0
+
+        numer_lo, numer_hi = 1e-10, 1.0
+        if K:
+            Zd0 = Z[int(dir_idx[0].item())]
+            B0 = Zd0.t().abs()  # (R,R) with B0[p,a] = |Z_ap|
+            Nm0 = (B0.unsqueeze(2) * B0.unsqueeze(1))  # (p,a,b) = |Z_ap|*|Z_bp|
+            m0 = Nm0.reshape(-1)
+            m0 = m0[m0 > 0]
+            if m0.numel():
+                numer_lo = float(torch.quantile(m0, 0.01).clamp_min(1e-10).item())
+                numer_hi = float(torch.quantile(m0, 0.99).clamp_min(numer_lo * 10.0).item())
+                numer_hi = min(numer_hi, 1.0)
+
+        def _make_edges(lo: float, hi: float, nb: int, device, dtype) -> torch.Tensor:
+            lo = max(lo, 1e-12)
+            hi = max(hi, lo * 10.0)
+            return torch.logspace(np.log10(lo), np.log10(hi), steps=nb + 1, device=device, dtype=dtype)
+
+        denom_edges = _make_edges(denom_lo, denom_hi, num_bins, Z.device, Z.dtype)
+        numer_edges = _make_edges(numer_lo, numer_hi, num_bins, Z.device, Z.dtype)
+        denom_centers = torch.sqrt(denom_edges[:-1] * denom_edges[1:])
+        numer_centers = torch.sqrt(numer_edges[:-1] * numer_edges[1:])
+
+        denom_sum = torch.zeros((num_bins,), device=Z.device, dtype=torch.float64)
+        denom_cnt = torch.zeros((num_bins,), device=Z.device, dtype=torch.float64)
+        numer_sum = torch.zeros((num_bins,), device=Z.device, dtype=torch.float64)
+        numer_cnt = torch.zeros((num_bins,), device=Z.device, dtype=torch.float64)
+
+        idx = torch.arange(R, device=Z.device)
+        a_grid = idx.view(1, R, 1)
+        b_grid = idx.view(1, 1, R)
+        p_grid = idx.view(R, 1, 1)
+        valid_triple_mask = (a_grid != b_grid) & (a_grid != p_grid) & (b_grid != p_grid)  # (p,a,b)
+
+        for di in dir_idx.tolist():
+            Zd = Z[int(di)]            # (R,R)
+            sd = s_hat[int(di)]        # (R,)
+
+            # ---- Denominator-stratified (pair-averaged over pivots) ----
+            s2 = (sd * sd + eps)
+            alpha = sd / s2            # (R,)
+            beta = 1.0 / s2            # (R,)
+            gamma = (sd * sd) / s2     # (R,)
+            mean_gamma = gamma.mean()
+
+            Q = Zd * Zd
+            A2 = (Zd * alpha.unsqueeze(0)) @ Zd              # Z diag(alpha) Z
+            A3 = (Q * beta.unsqueeze(0)) @ Q                 # (Z^2) diag(beta) (Z^2)
+            Rf = float(R)
+            resid_pair = (mean_gamma * Q) - (2.0 / Rf) * (Zd * A2) + (1.0 / Rf) * A3
+            resid_pair = resid_pair.clamp_min(0.0)
+
+            denom_x = Zd.abs()[off]
+            denom_y = resid_pair[off]
+            bin_idx = torch.bucketize(denom_x, denom_edges) - 1
+            m = (bin_idx >= 0) & (bin_idx < num_bins) & torch.isfinite(denom_y)
+            if m.any():
+                bi = bin_idx[m].to(torch.long)
+                denom_sum.index_add_(0, bi, denom_y[m].to(torch.float64))
+                denom_cnt.index_add_(0, bi, torch.ones_like(denom_y[m], dtype=torch.float64))
+
+            # ---- Numerator-stratified (triple-level; aggregated over pivots) ----
+            B = Zd.t().contiguous()  # (R,R) with B[p,a] = Z_ap
+            N = B.unsqueeze(2) * B.unsqueeze(1)  # (p,a,b)
+            denom_mat = Zd.unsqueeze(0)          # (1,a,b)
+            s_mat = sd.view(R, 1, 1)             # (p,1,1)
+            resid_triple = (s_mat * denom_mat - N)
+            resid_triple = (resid_triple * resid_triple) / (s_mat * s_mat + eps)
+            resid_triple = resid_triple.clamp_min(0.0)
+            numer_x = (B.abs().unsqueeze(2) * B.abs().unsqueeze(1))  # (p,a,b)
+
+            mx = numer_x[valid_triple_mask]
+            my = resid_triple[valid_triple_mask]
+            bin_idx2 = torch.bucketize(mx, numer_edges) - 1
+            m2 = (bin_idx2 >= 0) & (bin_idx2 < num_bins) & torch.isfinite(my)
+            if m2.any():
+                bi2 = bin_idx2[m2].to(torch.long)
+                numer_sum.index_add_(0, bi2, my[m2].to(torch.float64))
+                numer_cnt.index_add_(0, bi2, torch.ones_like(my[m2], dtype=torch.float64))
+
+        denom_rel = (denom_sum / denom_cnt.clamp_min(1.0)).to(dtype=Z.dtype)
+        numer_rel = (numer_sum / numer_cnt.clamp_min(1.0)).to(dtype=Z.dtype)
+
+        return rel_residual_by_echo, denom_centers, denom_rel, numer_centers, numer_rel
+
+
 def compute_echo_fit_diagnostics_from_aligned_svds(
     aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     nbins: int = 24,
