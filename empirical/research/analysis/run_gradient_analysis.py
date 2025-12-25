@@ -20,6 +20,7 @@ import logging
 import argparse
 from datetime import datetime
 import math
+import itertools
 import os
 import sys
 import re
@@ -50,7 +51,7 @@ from empirical.research.analysis.core_math import (
     matrix_shape_beta,
     stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
-    get_spectral_echoes_from_aligned_svds,
+    compute_echo_fit_diagnostics_from_aligned_svds,
     get_raw_svds,
     get_mean_svd,
     compute_alignment_angles_deg,
@@ -158,13 +159,18 @@ ANALYSIS_SPECS = [
         lambda rep, mean: compute_alignment_angles_deg(rep, mean)[1],  # [R,D]
     ),
 
-    # Spectral echo (classic reverb on aligned svds; no whitening, no PAV)
-    PropertySpec("spectral_echo_replicates", ["aligned_svds"], get_spectral_echoes_from_aligned_svds),
+    # Spectral echo + diagnostics (weighted Triple-OLS + residual checks)
+    PropertySpec("echo_fit_diagnostics", ["aligned_svds"], compute_echo_fit_diagnostics_from_aligned_svds),
+    PropertySpec("spectral_echo_replicates", ["echo_fit_diagnostics"], lambda d: d["spectral_echo_replicates"]),
     PropertySpec(
         "spectral_echo",
         ["spectral_echo_replicates"],
         lambda z: torch.median(z, dim=0).values.clamp(0.0, 1.0),  # [D]
     ),
+    PropertySpec("echo_fit_weighted_mse", ["echo_fit_diagnostics"], lambda d: d["echo_fit_weighted_mse"]),
+    PropertySpec("triple_mse_bins", ["echo_fit_diagnostics"], lambda d: d["triple_mse_bins"]),
+    PropertySpec("triple_mse_by_denom_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_denom_bin"]),
+    PropertySpec("triple_mse_by_numer_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_numer_bin"]),
 
     # Per-replica gradient stable ranks from singulars (original SVDs)
     PropertySpec("gradients_stable_rank",
@@ -687,6 +693,9 @@ def main():
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
         left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
         right_align_panel_ts: Dict[int, GPTLayerProperty] = {}
+        echo_fit_residual_ts: Dict[int, GPTLayerProperty] = {}
+        triple_respect_denom_ts: Dict[int, GPTLayerProperty] = {}
+        triple_respect_numer_ts: Dict[int, GPTLayerProperty] = {}
 
         for step in steps:
             aggregated_payload = load_step_artifacts(run_id, step)
@@ -694,11 +703,23 @@ def main():
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
             right_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="right")
+            echo_fit_residual_ts[step] = build_echo_fit_weighted_residual_panel(aggregated_payload)
+            triple_respect_denom_ts[step] = build_triple_respect_panel(aggregated_payload, which="denom")
+            triple_respect_numer_ts[step] = build_triple_respect_panel(aggregated_payload, which="numer")
 
         ts_run = datetime.now().strftime("%Y%m%d%H%M%S")
         out_dir = Path(f"research_logs/visualizations/{run_id}_generated_at_{ts_run}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, echo_singular_direct_ts, sv_gap_ts, left_align_panel_ts, right_align_panel_ts)
+        generate_gifs_for_run(
+            out_dir,
+            echo_singular_direct_ts,
+            sv_gap_ts,
+            left_align_panel_ts,
+            right_align_panel_ts,
+            echo_fit_residual_ts,
+            triple_respect_denom_ts,
+            triple_respect_numer_ts,
+        )
         return 0
 
     # --- Expensive compute path (distributed) ---
@@ -760,6 +781,127 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
             assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
             assert out[key]['sv'].shape == out[key]['spectral_echo'].shape
     return out
+
+def _bin_median_y_vs_x_logspace(x: np.ndarray, y: np.ndarray, nbins: int = 48, xmin: float = 1e-4, xmax: float = 1.0):
+    x = np.asarray(x, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    if not np.any(m):
+        xs = np.geomspace(xmin, xmax, nbins)
+        ys = np.full_like(xs, np.nan)
+        return xs, ys
+    x = x[m]
+    y = y[m]
+    bins = np.geomspace(xmin, xmax, nbins + 1)
+    centers = np.sqrt(bins[:-1] * bins[1:])
+    idx = np.clip(np.digitize(x, bins) - 1, 0, nbins - 1)
+    out = np.full(nbins, np.nan, dtype=float)
+    for i in range(nbins):
+        yi = y[idx == i]
+        if yi.size:
+            out[i] = np.nanmedian(yi)
+    return centers, out
+
+
+def build_echo_fit_weighted_residual_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Panel for log-log residual diagnostic:
+      x: fitted echo ζ̂ (binned, log-x)
+      y: weighted MSE contribution in ŝ=ζ^2 space (binned median, log-y)
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        if "spectral_echo_replicates" not in props or "echo_fit_weighted_mse" not in props:
+            continue
+        zeta = props["spectral_echo_replicates"]
+        mse = props["echo_fit_weighted_mse"]
+        zeta_np = zeta.detach().cpu().numpy() if isinstance(zeta, torch.Tensor) else np.asarray(zeta)
+        mse_np = mse.detach().cpu().numpy() if isinstance(mse, torch.Tensor) else np.asarray(mse)
+        xs, ys = _bin_median_y_vs_x_logspace(zeta_np, mse_np, nbins=48, xmin=1e-4, xmax=1.0)
+        out[key] = {
+            "x": xs,
+            "y": ys,
+            "shape": tuple(int(x) for x in props["shape"]),
+        }
+    return out
+
+
+def build_triple_respect_panel(aggregated_payload: GPTLayerProperty, which: str) -> GPTLayerProperty:
+    """
+    Panel for triple-respect diagnostic:
+      x: magnitude bins (|Z_ab| or |Z_ap Z_pb|)
+      y: conditional weighted MSE in ŝ-space for triples that fall in the bin
+    """
+    out: GPTLayerProperty = {}
+    ykey = "triple_mse_by_denom_bin" if which == "denom" else "triple_mse_by_numer_bin"
+    for key, props in aggregated_payload.items():
+        if "triple_mse_bins" not in props or ykey not in props:
+            continue
+        xb = props["triple_mse_bins"]
+        yb = props[ykey]
+        xb_np = xb.detach().cpu().numpy() if isinstance(xb, torch.Tensor) else np.asarray(xb)
+        yb_np = yb.detach().cpu().numpy() if isinstance(yb, torch.Tensor) else np.asarray(yb)
+        out[key] = {
+            "x": xb_np.astype(float),
+            "y": yb_np.astype(float),
+            "shape": tuple(int(x) for x in props["shape"]),
+        }
+    return out
+
+
+def create_echo_fit_weighted_residuals_loglog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+    ax.set_title(param_type)
+    ax.set_xlabel(r"Fitted echo $\hat{\zeta}$ (log)")
+    ax.set_ylabel(r"Median weighted MSE of $(\hat{s}-r)^2$ (log), $\hat{s}=\hat{\zeta}^2$")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(1e-4, 1.0)
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        x = np.asarray(d.get("x", []), dtype=float)
+        y = np.asarray(d.get("y", []), dtype=float)
+        m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+        if not np.any(m):
+            continue
+        color = viridis(layer / denom)
+        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, c=color)
+    return []
+
+
+def _create_triple_respect_loglog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int, which: str):
+    ax.set_title(f"{param_type} ({which})")
+    if which == "denom":
+        ax.set_xlabel(r"Denominator reverb magnitude $|Z_{ab}|$ (log)")
+    else:
+        ax.set_xlabel(r"Numerator reverb magnitude $|Z_{ap}Z_{pb}|$ (log)")
+    ax.set_ylabel(r"Conditional weighted MSE of $(\hat{s}-r)^2$ (log), $\hat{s}=\hat{\zeta}^2$")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(1e-6, 1.0)
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        x = np.asarray(d.get("x", []), dtype=float)
+        y = np.asarray(d.get("y", []), dtype=float)
+        m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+        if not np.any(m):
+            continue
+        color = viridis(layer / denom)
+        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, c=color)
+    return []
+
+
+def create_triple_respect_denom_loglog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_triple_respect_loglog_subplot(ax, panel, param_type, viridis, max_layers, which="denom")
+
+
+def create_triple_respect_numer_loglog_subplot(ax, panel, param_type, viridis, max_layers: int):
+    return _create_triple_respect_loglog_subplot(ax, panel, param_type, viridis, max_layers, which="numer")
 
 def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     """
@@ -841,6 +983,9 @@ def generate_gifs_for_run(
     sv_gap_ts: Dict[int, GPTLayerProperty],
     left_align_ts: Dict[int, GPTLayerProperty],
     right_align_ts: Dict[int, GPTLayerProperty],
+    echo_fit_residual_ts: Dict[int, GPTLayerProperty],
+    triple_respect_denom_ts: Dict[int, GPTLayerProperty],
+    triple_respect_numer_ts: Dict[int, GPTLayerProperty],
 ):
     make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
     # Normalized-x spectral-echo plot (using direct tau2 overlays)
@@ -855,6 +1000,26 @@ def generate_gifs_for_run(
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_z_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_deg_vs_sv_semilog_subplot, title="left_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_deg_vs_sv_semilog_subplot, title="right_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
+
+    # Echo-fit diagnostics:
+    make_gif_from_layer_property_time_series(
+        echo_fit_residual_ts,
+        create_echo_fit_weighted_residuals_loglog_subplot,
+        title="echo_fit_weighted_residuals_vs_fitted_echo",
+        output_dir=out_dir,
+    )
+    make_gif_from_layer_property_time_series(
+        triple_respect_denom_ts,
+        create_triple_respect_denom_loglog_subplot,
+        title="triple_respect_weighted_mse_vs_denom_reverb",
+        output_dir=out_dir,
+    )
+    make_gif_from_layer_property_time_series(
+        triple_respect_numer_ts,
+        create_triple_respect_numer_loglog_subplot,
+        title="triple_respect_weighted_mse_vs_numer_reverb",
+        output_dir=out_dir,
+    )
 
 if __name__ == "__main__":
     sys.exit(main())

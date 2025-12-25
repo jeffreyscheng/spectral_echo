@@ -7,7 +7,7 @@ the analysis pipeline. It provides both numpy and torch implementations where
 needed, with consistent interfaces.
 """
 
-from typing import Union, Tuple, Dict, List
+from typing import Union, Tuple, Dict, List, Any
 import numpy as np
 try:
     from scipy.optimize import curve_fit as _scipy_curve_fit
@@ -409,6 +409,141 @@ def get_spectral_echoes_from_aligned_svds(
         echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)  # (R,D)
         return echoes_zeta
 
+
+def compute_echo_fit_diagnostics_from_aligned_svds(
+    aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    nbins: int = 24,
+    diag_num_directions: int = 128,
+    min_mag: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """
+    Diagnostics for whether the weighted Triple-OLS echo fit is behaving.
+
+    Outputs:
+      - spectral_echo_replicates: ζ̂_{p,k} (R,D)
+      - echo_fit_weighted_mse:  E_w[(ŝ_{p,k} - r)^2] per (p,k) under w_ab = Z_ab^2 (R,D)
+        where ŝ_{p,k} = ζ̂_{p,k}^2 and r_{ab->p,k} = (Z_ap Z_pb) / Z_ab (diag excluded).
+      - triple_mse_by_denom_bin: binned (by |Z_ab|) conditional weighted MSE (nbins,)
+      - triple_mse_by_numer_bin: binned (by |Z_ap Z_pb|) conditional weighted MSE (nbins,)
+      - triple_mse_bins: geometric bin centers in [min_mag, 1] (nbins,)
+
+    Notes:
+      - echo_fit_weighted_mse uses a division-free identity for the *weighted* objective:
+            w_ab (ŝ - r)^2 with w_ab = Z_ab^2
+        and computes E_w[r^2] exactly (excluding diagonal) without forming r.
+      - binned triple-respect curves are computed on a log-spaced subset of directions
+        (to keep compute bounded) but include all pivots p and all replica pairs (a,b).
+    """
+    with torch.no_grad():
+        U_rep, _S_rep, V_rep = aligned_svds  # U:[R,H,D], V:[R,W,D]
+        if U_rep.dtype == torch.bfloat16:
+            U_rep = U_rep.float()
+        if V_rep.dtype == torch.bfloat16:
+            V_rep = V_rep.float()
+
+        R, _H, D = U_rep.shape
+        # (D,R,H/W)
+        U_stacked = U_rep.permute(2, 0, 1)
+        V_stacked = V_rep.permute(2, 0, 1)
+
+        gram_U = torch.einsum("dri,dsi->drs", U_stacked, U_stacked)  # (D,R,R)
+        gram_V = torch.einsum("dri,dsi->drs", V_stacked, V_stacked)  # (D,R,R)
+        Z = gram_U * gram_V  # (D,R,R)
+
+        eye = torch.eye(R, device=Z.device, dtype=Z.dtype)
+        offdiag = (1.0 - eye).unsqueeze(0)  # (1,R,R)
+        Z = Z * offdiag  # zero diag
+
+        eps = torch.finfo(Z.dtype).eps
+        denom = (Z * Z).sum(dim=(-2, -1)).clamp_min(eps)  # (D,)
+
+        # ŝ_{p,k} = ζ̂^2 from division-free weighted Triple-OLS (same as existing estimator)
+        zz = Z @ Z  # (D,R,R)
+        numerator = (zz * Z.transpose(-1, -2)).sum(dim=-1)  # (D,R)
+        echo_sq = (numerator / denom.unsqueeze(-1)).clamp_min(0.0)  # (D,R)
+        echo_zeta = torch.sqrt(echo_sq).transpose(0, 1)  # (R,D)
+
+        # Per-(p,k) weighted MSE of the LS objective in ŝ-space:
+        #   MSE = E_w[(ŝ - r)^2] with ŝ = E_w[r] => MSE = E_w[r^2] - ŝ^2
+        # With w_ab = Z_ab^2 and r = (Z_ap Z_pb)/Z_ab (diag excluded),
+        #   w_ab * r^2 = (Z_ap^2)(Z_pb^2) for offdiag entries (division cancels),
+        # so E_w[r^2] can be computed without forming r.
+        Z2 = Z * Z  # (D,R,R)
+        col_sum2 = Z2.sum(dim=1)  # (D,R) = Σ_a Z_ap^2
+        col_sum4 = (Z2 * Z2).sum(dim=1)  # (D,R) = Σ_a Z_ap^4
+        sumN2_offdiag = (col_sum2 * col_sum2) - col_sum4  # (D,R) = Σ_{a!=b} Z_ap^2 Z_pb^2
+        Er2 = sumN2_offdiag / denom.unsqueeze(-1)  # (D,R)
+        mse_shat = (Er2 - (echo_sq * echo_sq)).clamp_min(0.0)  # (D,R)
+        mse_shat = mse_shat.transpose(0, 1)  # (R,D)
+
+        # --- triple-respect curves (binned conditional weighted MSE) ---
+        nbins = int(max(4, nbins))
+        min_mag = float(min_mag)
+        # Bin edges in [min_mag, 1]
+        edges = torch.logspace(
+            np.log10(min_mag),
+            0.0,
+            steps=nbins + 1,
+            device=Z.device,
+            dtype=Z.dtype,
+        )
+        bin_centers = torch.sqrt(edges[:-1] * edges[1:])  # (nbins,)
+
+        # Choose direction indices (log-spaced over [0, D-1]) for bin curves
+        nd = int(min(max(4, diag_num_directions), D))
+        t = torch.linspace(0.0, 1.0, steps=nd, device=Z.device, dtype=torch.float32)
+        idx = torch.round(torch.exp(t * float(np.log(max(D, 2)))) - 1.0).to(torch.long)
+        idx = torch.clamp(idx, 0, D - 1)
+        idx = torch.unique(torch.cat([idx, torch.tensor([0, D - 1], device=Z.device, dtype=torch.long)]))
+        Zs = Z.index_select(0, idx)  # (Ds,R,R)
+        echo_sq_s = echo_sq.index_select(0, idx)  # (Ds,R)
+
+        Ds = int(Zs.shape[0])
+        offdiag2 = (1.0 - eye)  # (R,R)
+        denom_mag = Zs.abs()  # (Ds,R,R)
+        w = (Zs * Zs) * offdiag2.unsqueeze(0)  # (Ds,R,R)
+
+        # denom bins: membership depends only on (d,a,b), not p
+        denom_idx = torch.bucketize(denom_mag.reshape(-1), edges) - 1
+        denom_idx = denom_idx.clamp(0, nbins - 1)
+        w_flat = w.reshape(-1)
+        denom_w_once = torch.bincount(denom_idx, weights=w_flat, minlength=nbins)  # (nbins,)
+        denom_w_total = denom_w_once * float(R)
+        denom_c_total = torch.zeros(nbins, device=Z.device, dtype=Z.dtype)
+
+        numer_w_total = torch.zeros(nbins, device=Z.device, dtype=Z.dtype)
+        numer_c_total = torch.zeros(nbins, device=Z.device, dtype=Z.dtype)
+
+        # Loop pivots; per-pivot contribution is computed division-free (diag excluded)
+        for p in range(R):
+            s = echo_sq_s[:, p].view(Ds, 1, 1)  # (Ds,1,1) == ŝ
+            u = Zs[:, :, p].unsqueeze(2)  # (Ds,R,1)
+            v = Zs[:, p, :].unsqueeze(1)  # (Ds,1,R)
+            N = u * v  # (Ds,R,R) == Z_ap Z_pb
+
+            # contrib = w * (ŝ - r)^2, with w=Z_ab^2 and r=N/Z_ab, diag excluded:
+            #   w(ŝ - N/Z)^2 = (Z^2)(ŝ^2) - 2(Z)(ŝ)(N) + (N^2), for offdiag entries.
+            contrib = ((Zs * Zs) * (s * s) - 2.0 * Zs * s * N + (N * N)) * offdiag2.unsqueeze(0)  # (Ds,R,R)
+            c_flat = contrib.reshape(-1)
+            denom_c_total += torch.bincount(denom_idx, weights=c_flat, minlength=nbins)
+
+            # numerator bins depend on p via N
+            numer_mag = N.abs()
+            numer_idx = torch.bucketize(numer_mag.reshape(-1), edges) - 1
+            numer_idx = numer_idx.clamp(0, nbins - 1)
+            numer_w_total += torch.bincount(numer_idx, weights=w_flat, minlength=nbins)
+            numer_c_total += torch.bincount(numer_idx, weights=c_flat, minlength=nbins)
+
+        denom_mse = denom_c_total / denom_w_total.clamp_min(eps)  # (nbins,)
+        numer_mse = numer_c_total / numer_w_total.clamp_min(eps)  # (nbins,)
+
+        return {
+            "spectral_echo_replicates": echo_zeta,  # (R,D)
+            "echo_fit_weighted_mse": mse_shat,  # (R,D)
+            "triple_mse_bins": bin_centers,  # (nbins,)
+            "triple_mse_by_denom_bin": denom_mse,  # (nbins,)
+            "triple_mse_by_numer_bin": numer_mse,  # (nbins,)
+        }
 
 def get_mean_svd(mean_gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
