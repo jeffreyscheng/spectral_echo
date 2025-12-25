@@ -1,4 +1,5 @@
 """
+empirical/research/analysis/artifact_store.py
 Artifact store for expensive gradient-analysis outputs.
 
 Goal: decouple expensive compute (SVDs, echoes, etc.) from visualization iteration.

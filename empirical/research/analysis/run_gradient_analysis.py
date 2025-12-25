@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+empirical/research/analysis/run_gradient_analysis.py
 Refactored gradient distribution analysis with clean property pipeline architecture.
 
 This script computes gradient analysis using a declarative property pipeline approach

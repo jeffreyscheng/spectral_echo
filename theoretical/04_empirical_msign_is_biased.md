@@ -1,3 +1,7 @@
+<!--
+theoretical/04_empirical_msign_is_biased.md
+-->
+
 # Empirical Msign is Biased
 
 For true gradient $G=\nabla_W L$ and minibatch gradient $\hat{G}=G+E$ under Gaussian noise model $E\sim N(0, \Sigma)$, we can straightforwardly show that $\hat{G}$ is an unbiased estimator of $G$ by linearity of expectation.  

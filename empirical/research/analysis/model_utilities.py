@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+empirical/research/analysis/model_utilities.py
 Unified model parameter processing utilities.
 
 Consolidates model parameter extraction, layer property management,

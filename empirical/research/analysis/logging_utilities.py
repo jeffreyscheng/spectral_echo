@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+empirical/research/analysis/logging_utilities.py
 Unified logging utilities for gradient analysis.
 
 Consolidates online and offline logging functionality including:

@@ -1,3 +1,8 @@
+<!--
+theoretical/01_msign_as_steepest_descent.md
+-->
+
+
 # Muon is a steepest descent optimizer.
 
 The gradient is referred to as the direction of steepest descent, but this masks a silent assumption. For a vector $w\in\mathbb{R}^m$, function $L:\mathbb{R}^m\rightarrow\mathbb{R}$, and arbitrary norm $\Vert \cdot \Vert_\_ $ we define the direction of steepest descent $\Delta w$ at $w$ to be:

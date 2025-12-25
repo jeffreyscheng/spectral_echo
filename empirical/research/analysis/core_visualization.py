@@ -1,4 +1,5 @@
 """
+empirical/research/analysis/core_visualization.py
 Core visualization utilities for gradient analysis.
 
 This module provides all the plotting and gif generation functionality needed

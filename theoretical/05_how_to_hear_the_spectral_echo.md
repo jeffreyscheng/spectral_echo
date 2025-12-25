@@ -1,3 +1,7 @@
+<!--
+theoretical/05_how_to_hear_the_spectral_echo.md
+-->
+
 # How to hear the echo without the true gradient
 
 We previously showed that the empirical msign is biased and that replacing the empirical spectrum with the spectral echo is the best way to project onto msign of the true gradient using the empirical singular bases; however, calculating the spectral echo from its definition requires access to the true gradient, and our entire motivation comes from only having access to empirical gradients.

@@ -1,4 +1,5 @@
 """
+empirical/research/analysis/property_pipeline.py
 Property-based computation pipeline for gradient analysis.
 
 This module implements a declarative approach to specifying and executing

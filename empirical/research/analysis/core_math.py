@@ -1,4 +1,5 @@
 """
+empirical/research/analysis/core_math.py
 Core mathematical functions for gradient analysis.
 
 This module contains all the fundamental mathematical operations needed across

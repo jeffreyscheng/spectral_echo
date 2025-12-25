@@ -1,3 +1,7 @@
+<!--
+theoretical/03_sum_of_orth_vs_orth_of_sum.md
+-->
+
 # The M in Muon
 
 Muon stands for **M**oment**U**m **O**rthogonalized by **N**ewton-Schulz.

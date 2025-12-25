@@ -1,3 +1,8 @@
+"""
+empirical/research/analysis/constants.py
+Constants for the gradient analysis pipeline.
+"""
+
 FIELD_NAMES = [
     # >>> keep this list exactly in the order you currently write <<<
     # Examples (replace with your real keys):

@@ -1,3 +1,7 @@
+<!--
+theoretical/02_odd_quintics_as_fast_msign.md
+-->
+
 # Odd Quintics Compute msign Really Fast
 
 msign should be easy, but it's not.
