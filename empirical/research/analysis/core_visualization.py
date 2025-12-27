@@ -91,19 +91,6 @@ def newton_schulz_quintic_function(x):
     return out
 
 
-def predict_spectral_echo_curve_np(s: np.ndarray, tau2: float) -> np.ndarray:
-    """Predict E[spectral_echo(s)] = 1 / (1 + tau^2 / s^2).
-
-    Args:
-        s: singular values (>=0)
-        tau2: fitted phase constant
-    """
-    s = np.asarray(s, dtype=float)
-    eps = 1e-12
-    s2 = np.maximum(s * s, eps)
-    return 1.0 / (1.0 + (tau2 / s2))
-
-
 def create_reverb_fit_relative_residual_vs_echo_loglog_subplot(
     ax,
     panel: GPTLayerProperty,

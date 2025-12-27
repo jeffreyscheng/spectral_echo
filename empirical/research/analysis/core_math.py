@@ -65,14 +65,6 @@ def matrix_shape_beta(shape: Union[Tuple[int, int], torch.Size]) -> float:
     return float(a) / float(b)
 
 
-# Backward-compatible alias used elsewhere in the codebase
-## No alias needed; use matrix_shape_beta directly
-
-
-## Removed MP-specific density helpers (mp_pdf_singular_*). Finite-size Wishart overlays
-## now come from tabulated CDFs (see wishart_tables.py).
-
-
 def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast, robust SVD for [H,W] or [B,H,W].
@@ -89,17 +81,6 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
 
         U, s, Vh = torch.linalg.svd(x, full_matrices=False)
         return U, s, Vh
-
-
-########################
-# Removed legacy echo/alignment helpers
-########################
-
-
-########################
-# Core convenience functions
-########################
-
 
 # Convenience functions for common operations
 def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
@@ -146,107 +127,6 @@ def estimate_gradient_noise_sigma2(
         denom = max(1, (B - 1) * m * n)
         return total_frob2 / denom
 
-def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
-    log_s = np.log(s)
-    edges = np.linspace(log_s.min(), log_s.max(), nbins + 1)
-    idx = np.clip(np.digitize(log_s, edges) - 1, 0, nbins - 1)
-    counts = np.bincount(idx, minlength=nbins).astype(np.float64)
-    w = 1.0 / np.maximum(counts[idx], 1.0)
-    return w * (len(w) / w.sum())
-
-
-def _spectral_echo_model_np(s: np.ndarray, tau2: float) -> np.ndarray:
-    return 1.0 / (1.0 + (tau2 / (s * s)))
-
-
-def fit_empirical_phase_constant_tau2(
-    minibatch_singular_values: torch.Tensor,
-    spectral_echo: torch.Tensor,
-    eps: float = 1e-12,
-    nbins: int = 32,
-) -> float:
-    """Fit tau^2 in echo(s)=1/(1+tau^2/s^2) with REQUIRED SciPy nonlinear LS.
-
-    - `minibatch_singular_values` (replica singulars): [R, K]
-    - `spectral_echo`: [Kc] (per-direction, aggregated across replicas)
-    We pair the first Kc singulars per replica with the Kc echoes, tile echoes across B,
-    and fit a single tau^2.
-
-    Raises:
-        RuntimeError on any missing SciPy or fitting failure.
-        ValueError on shape mismatch.
-    """
-    if _scipy_curve_fit is None:
-        raise RuntimeError("SciPy is required for fit_empirical_phase_constant_tau2 but is not available.")
-
-    with torch.no_grad():
-        if minibatch_singular_values.ndim != 2:
-            raise ValueError(f"minibatch_singular_values must be [B,K], got {tuple(minibatch_singular_values.shape)}")
-        if spectral_echo.ndim != 1:
-            raise ValueError(f"spectral_echo must be [Kc], got {tuple(spectral_echo.shape)}")
-
-        B, K = minibatch_singular_values.shape
-        Kc = int(spectral_echo.numel())
-        if Kc > K:
-            raise ValueError(f"spectral_echo length Kc={Kc} exceeds K={K}.")
-
-        # Pair only the first Kc directions with the Kc echoes
-        s_use = minibatch_singular_values[:, :Kc]             # [B, Kc]
-        echo_use = spectral_echo.view(1, Kc).expand(B, Kc)    # [B, Kc]
-
-        s = s_use.reshape(-1).detach().cpu().numpy().astype(np.float64)       # [B*Kc]
-        echo = echo_use.reshape(-1).detach().cpu().numpy().astype(np.float64) # [B*Kc]
-        if s.size == 0:
-            raise RuntimeError("No samples to fit tau^2 (B*Kc == 0).")
-
-        # Guard against zeros to keep the model well-defined
-        s = np.clip(s, eps, None)
-        echo = np.clip(echo, eps, 1.0 - eps)
-
-        # Reweight in log-space to avoid over-emphasizing dense low-s regions
-        w = _logspace_weights_np(s, nbins=nbins)             # length = B*Kc
-        sigma = 1.0 / np.sqrt(np.maximum(w, eps))
-
-        # Moment-based positive initialization
-        tau2_init = float(np.mean((s * s) * (1.0 / echo - 1.0)))
-        tau2_init = max(tau2_init, eps)
-
-        (tau2_hat,), _ = _scipy_curve_fit(
-            _spectral_echo_model_np,
-            xdata=s,
-            ydata=echo,
-            p0=(tau2_init,),
-            bounds=(eps, 1e40),
-            sigma=sigma,
-            absolute_sigma=False,
-            maxfev=20000,
-        )
-
-        tau2_hat = float(tau2_hat)
-        if not np.isfinite(tau2_hat) or tau2_hat < 0.0:
-            raise RuntimeError(f"Invalid tau^2 estimate: {tau2_hat}")
-
-        return tau2_hat
-
-
-def fit_empirical_noise_to_phase_slope_kappa(
-    gradient_noise_sigma2: GPTLayerProperty,
-    empirical_phase_constant_tau2: GPTLayerProperty
-) -> float:
-    """Fit kappa in tau^2 ≈ kappa * sigma^2 using per-layer points.
-
-    Input dicts map (param_type, layer) -> scalar. We perform a
-    through-origin least squares fit across available layers.
-    """
-    with torch.no_grad():
-        # Intersect keys to align x,y
-        keys = [k for k in empirical_phase_constant_tau2.keys() if k in gradient_noise_sigma2]
-        if not keys:
-            return float('nan')
-        sigma2s = torch.tensor([float(gradient_noise_sigma2[k]) for k in keys], dtype=torch.float64).reshape(-1, 1)
-        tau2s = torch.tensor([float(empirical_phase_constant_tau2[k]) for k in keys], dtype=torch.float64).reshape(-1, 1)
-        sol = torch.linalg.lstsq(sigma2s, tau2s).solution  # [1,1]
-        return float(sol.squeeze())
 
 ########################
 # Spectral reverb solver (tuning-free debiased variant)
@@ -255,9 +135,6 @@ def fit_empirical_noise_to_phase_slope_kappa(
 def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
     right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
-    noise_quantile: float = 0.02, # UNUSED in this debiased, tuning-free variant
-    tau_mult: float = 1.5,        # UNUSED in this debiased, tuning-free variant
-    weight_power: float = 2.0,    # UNUSED in this debiased, tuning-free variant
 ) -> torch.Tensor:                # returns echoes with shape (r, Kc)
     """
     Debiased spectral-echo estimator (no tunable floors, no weights).
@@ -361,54 +238,6 @@ def solve_for_spectral_echo_using_reverb(
         echoes = torch.sqrt(rtilde.clamp_min(0.0))         # (p,Kc) == (r,Kc)
 
         return echoes
-
-def get_spectral_echoes_from_aligned_svds(
-    aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-) -> torch.Tensor:
-    """
-    Compute per-replica spectral echoes from *aligned* SVD bases.
-
-    Args:
-        aligned_svds: (U, S, V) where
-            U: [R, N, D]
-            S: [R, D]
-            V: [R, M, D]
-        (R = num_replicas, D = min(N, M))
-
-    Returns:
-        echoes_zeta: [R, D] tensor of spectral echoes per replica, per direction.
-    """
-    with torch.no_grad():
-        aligned_U, _, aligned_V = aligned_svds  # U:(R,N,D), V:(R,M,D)
-        if aligned_U.dtype == torch.bfloat16:
-            aligned_U = aligned_U.float()
-        if aligned_V.dtype == torch.bfloat16:
-            aligned_V = aligned_V.float()
-
-        num_replicates_R, _, dim_D = aligned_U.shape
-
-        # (D, R, N) and (D, R, M)
-        U_stacked = aligned_U.permute(2, 0, 1)
-        V_stacked = aligned_V.permute(2, 0, 1)
-
-        # Gram over feature dimension for each direction
-        gram_U = torch.einsum('dri,dsi->drs', U_stacked, U_stacked)  # (D,R,R)
-        gram_V = torch.einsum('dri,dsi->drs', V_stacked, V_stacked)  # (D,R,R)
-        reverb_tensor_Z = gram_U * gram_V                            # (D,R,R)
-
-        eye = torch.eye(num_replicates_R, device=reverb_tensor_Z.device, dtype=reverb_tensor_Z.dtype)
-        reverb_tensor_Z = reverb_tensor_Z * (1 - eye.unsqueeze(0))   # zero diag
-
-        # Triple-ratio estimator (same math as before)
-        zz = reverb_tensor_Z @ reverb_tensor_Z                       # (D,R,R)
-        numerator = (zz * reverb_tensor_Z.transpose(-1, -2)).sum(dim=-1)  # (D,R)
-        denominator = (reverb_tensor_Z * reverb_tensor_Z).sum(dim=(-2, -1))
-        denominator = denominator.clamp_min(torch.finfo(reverb_tensor_Z.dtype).eps)  # (D,)
-
-        echoes_sq = numerator / denominator.unsqueeze(-1)            # (D,R)
-        echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)  # (R,D)
-        return echoes_zeta
-
 
 def compute_reverb_fit_relative_diagnostics(
     aligned_svds: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -879,86 +708,3 @@ def get_raw_svds(
 
 # Backward-compat alias for older call sites.
 get_aligned_svds = get_raw_svds
-
-
-def compute_kron_whitening_factors_from_residuals(
-    residuals: torch.Tensor,
-    eps: float = 1e-6,
-) -> Dict[str, torch.Tensor]:
-    """Estimate left/right whitening factors from residual gradients.
-
-    residuals: [R, H, W], centered per-replica gradients:
-        residuals[r] = G_r - G_bar
-
-    We approximate Σ ≈ C_R ⊗ C_L with
-        C_L = (1/(R-1)) Σ_r (G_r - Ḡ)(G_r - Ḡ)^T  ∈ R^{H×H}
-        C_R = (1/(R-1)) Σ_r (G_r - Ḡ)^T(G_r - Ḡ)  ∈ R^{W×W}
-
-    and return their inverse square roots:
-        W_L = C_L^{-1/2}, W_R = C_R^{-1/2}.
-    """
-    with torch.no_grad():
-        if residuals.dtype == torch.bfloat16:
-            residuals = residuals.float()
-        R, H, W = residuals.shape
-        if R <= 1:
-            # Not enough replicas to estimate covariance; identity whitening.
-            W_L = torch.eye(H, dtype=residuals.dtype, device=residuals.device)
-            W_R = torch.eye(W, dtype=residuals.dtype, device=residuals.device)
-            return {"left_inv_sqrt": W_L, "right_inv_sqrt": W_R}
-
-        # Unbiased denominator
-        denom = float(max(R - 1, 1))
-
-        # Compute C_L and C_R via batched einsums
-        # C_L[i,j] = 1/(R-1) Σ_{r,w} residuals[r,i,w] * residuals[r,j,w]
-        C_L = torch.einsum("rhw,rkw->hk", residuals, residuals) / denom  # [H,H]
-        # C_R[p,q] = 1/(R-1) Σ_{r,h} residuals[r,h,p] * residuals[r,h,q]
-        C_R = torch.einsum("rhp,rhq->pq", residuals, residuals) / denom  # [W,W]
-
-        def inv_sqrt_psd(C: torch.Tensor) -> torch.Tensor:
-            # Symmetric PSD inverse square root via eigh
-            evals, evecs = torch.linalg.eigh(C)
-            evals_clamped = torch.clamp(evals, min=eps)
-            inv_sqrt = evals_clamped.rsqrt()
-            # (evecs * inv_sqrt) @ evecs^T
-            return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.transpose(-2, -1)
-
-        W_L = inv_sqrt_psd(C_L)
-        W_R = inv_sqrt_psd(C_R)
-        return {"left_inv_sqrt": W_L, "right_inv_sqrt": W_R}
-
-
-def apply_kron_whitening(
-    per_replicate_gradient: torch.Tensor,
-    whitening_factors: Dict[str, torch.Tensor],
-) -> torch.Tensor:
-    """Apply Kronecker whitening to per-replica gradients.
-
-    Args:
-        per_replicate_gradient: [R, H, W]
-        whitening_factors: dict with
-            'left_inv_sqrt':  [H,H]
-            'right_inv_sqrt': [W,W]
-
-    Returns:
-        whitened_gradients: [R, H, W] with
-            G̃_r = W_L @ G_r @ W_R
-    """
-    with torch.no_grad():
-        G = per_replicate_gradient
-        if G.dtype == torch.bfloat16:
-            G = G.float()
-        R, H, W = G.shape
-
-        W_L = whitening_factors["left_inv_sqrt"]
-        W_R = whitening_factors["right_inv_sqrt"]
-
-        # Sanity: broadcast shapes must match per-layer dims
-        assert W_L.shape == (H, H), f"Left whitening shape {W_L.shape} != ({H},{H})"
-        assert W_R.shape == (W, W), f"Right whitening shape {W_R.shape} != ({W},{W})"
-
-        out = torch.empty_like(G, dtype=G.dtype, device=G.device)
-        for r in range(R):
-            out[r] = W_L @ G[r] @ W_R
-        return out

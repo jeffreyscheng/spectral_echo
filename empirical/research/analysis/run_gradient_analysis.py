@@ -44,7 +44,7 @@ from empirical.research.training.training_core import (
 )
 from empirical.research.analysis.model_utilities import (
     get_weight_matrices, get_accumulated_gradient_matrices,
-    combine_layer_properties, gather_layer_properties_to_rank_zero, GPTLayerProperty
+    combine_layer_properties, GPTLayerProperty
 )
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
@@ -797,127 +797,6 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
             assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
             assert out[key]['sv'].shape == out[key]['spectral_echo'].shape
     return out
-
-def _bin_median_y_vs_x_logspace(x: np.ndarray, y: np.ndarray, nbins: int = 48, xmin: float = 1e-4, xmax: float = 1.0):
-    x = np.asarray(x, dtype=float).reshape(-1)
-    y = np.asarray(y, dtype=float).reshape(-1)
-    m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-    if not np.any(m):
-        xs = np.geomspace(xmin, xmax, nbins)
-        ys = np.full_like(xs, np.nan)
-        return xs, ys
-    x = x[m]
-    y = y[m]
-    bins = np.geomspace(xmin, xmax, nbins + 1)
-    centers = np.sqrt(bins[:-1] * bins[1:])
-    idx = np.clip(np.digitize(x, bins) - 1, 0, nbins - 1)
-    out = np.full(nbins, np.nan, dtype=float)
-    for i in range(nbins):
-        yi = y[idx == i]
-        if yi.size:
-            out[i] = np.nanmedian(yi)
-    return centers, out
-
-
-def build_echo_fit_weighted_residual_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
-    """
-    Panel for log-log residual diagnostic:
-      x: fitted echo ζ̂ (binned, log-x)
-      y: weighted MSE contribution in ŝ=ζ^2 space (binned median, log-y)
-    """
-    out: GPTLayerProperty = {}
-    for key, props in aggregated_payload.items():
-        if "spectral_echo_replicates" not in props or "echo_fit_weighted_mse" not in props:
-            continue
-        zeta = props["spectral_echo_replicates"]
-        mse = props["echo_fit_weighted_mse"]
-        zeta_np = zeta.detach().cpu().numpy() if isinstance(zeta, torch.Tensor) else np.asarray(zeta)
-        mse_np = mse.detach().cpu().numpy() if isinstance(mse, torch.Tensor) else np.asarray(mse)
-        xs, ys = _bin_median_y_vs_x_logspace(zeta_np, mse_np, nbins=48, xmin=1e-4, xmax=1.0)
-        out[key] = {
-            "x": xs,
-            "y": ys,
-            "shape": tuple(int(x) for x in props["shape"]),
-        }
-    return out
-
-
-def build_triple_respect_panel(aggregated_payload: GPTLayerProperty, which: str) -> GPTLayerProperty:
-    """
-    Panel for triple-respect diagnostic:
-      x: magnitude bins (|Z_ab| or |Z_ap Z_pb|)
-      y: conditional weighted MSE in ŝ-space for triples that fall in the bin
-    """
-    out: GPTLayerProperty = {}
-    ykey = "triple_mse_by_denom_bin" if which == "denom" else "triple_mse_by_numer_bin"
-    for key, props in aggregated_payload.items():
-        if "triple_mse_bins" not in props or ykey not in props:
-            continue
-        xb = props["triple_mse_bins"]
-        yb = props[ykey]
-        xb_np = xb.detach().cpu().numpy() if isinstance(xb, torch.Tensor) else np.asarray(xb)
-        yb_np = yb.detach().cpu().numpy() if isinstance(yb, torch.Tensor) else np.asarray(yb)
-        out[key] = {
-            "x": xb_np.astype(float),
-            "y": yb_np.astype(float),
-            "shape": tuple(int(x) for x in props["shape"]),
-        }
-    return out
-
-
-def create_echo_fit_weighted_residuals_loglog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
-    ax.set_title(param_type)
-    ax.set_xlabel(r"Fitted echo $\hat{\zeta}$ (log)")
-    ax.set_ylabel(r"Median weighted MSE of $(\hat{s}-r)^2$ (log), $\hat{s}=\hat{\zeta}^2$")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(1e-4, 1.0)
-    denom = max(1, max_layers - 1)
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
-        x = np.asarray(d.get("x", []), dtype=float)
-        y = np.asarray(d.get("y", []), dtype=float)
-        m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-        if not np.any(m):
-            continue
-        color = viridis(layer / denom)
-        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, c=color)
-    return []
-
-
-def _create_triple_respect_loglog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int, which: str):
-    ax.set_title(f"{param_type} ({which})")
-    if which == "denom":
-        ax.set_xlabel(r"Denominator reverb magnitude $|Z_{ab}|$ (log)")
-    else:
-        ax.set_xlabel(r"Numerator reverb magnitude $|Z_{ap}Z_{pb}|$ (log)")
-    ax.set_ylabel(r"Conditional weighted MSE of $(\hat{s}-r)^2$ (log), $\hat{s}=\hat{\zeta}^2$")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(1e-6, 1.0)
-    denom = max(1, max_layers - 1)
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
-        x = np.asarray(d.get("x", []), dtype=float)
-        y = np.asarray(d.get("y", []), dtype=float)
-        m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-        if not np.any(m):
-            continue
-        color = viridis(layer / denom)
-        ax.plot(x[m], y[m], lw=1.2, alpha=0.9, c=color)
-    return []
-
-
-def create_triple_respect_denom_loglog_subplot(ax, panel, param_type, viridis, max_layers: int):
-    return _create_triple_respect_loglog_subplot(ax, panel, param_type, viridis, max_layers, which="denom")
-
-
-def create_triple_respect_numer_loglog_subplot(ax, panel, param_type, viridis, max_layers: int):
-    return _create_triple_respect_loglog_subplot(ax, panel, param_type, viridis, max_layers, which="numer")
 
 def build_singular_gap_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     """
