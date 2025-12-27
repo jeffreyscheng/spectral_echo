@@ -302,7 +302,7 @@ def make_gif_from_layer_property_time_series(
     # 4) Write GIF
     images = [imageio.imread(p) for p in png_paths]
     gif_path = out_dir / f"{str(title).replace(' ', '_')}.gif"
-    imageio.mimsave(gif_path, images, fps=12, loop=0)
+    imageio.mimsave(gif_path, images, fps=5, loop=0)
     for p in png_paths:
         Path(p).unlink(missing_ok=True)
     return gif_path
