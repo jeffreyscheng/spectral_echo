@@ -13,6 +13,7 @@ FIELD_NAMES = [
     "left_alignment_angles_deg",
     "right_alignment_angles_deg",
     "spectral_echo",
+    "multiplicative_plateau_stats",
     # ---- echo-fit diagnostics (small enough to serialize; used by render-only plots)
     "spectral_echo_replicates",
     "echo_fit_weighted_mse",

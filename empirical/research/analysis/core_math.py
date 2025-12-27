@@ -591,6 +591,80 @@ def compute_alignment_angles_deg(
         return left_angles, right_angles
 
 
+def compute_multiplicative_plateau_stats(
+    left_alignment_angles_deg: torch.Tensor,
+    right_alignment_angles_deg: torch.Tensor,
+    spectral_echo: torch.Tensor,
+    aligned_replicate_singular_values: torch.Tensor,
+    top_k: int = 8,
+) -> dict:
+    """
+    left_alignment_angles_deg: [num_replicas, num_dirs]
+    right_alignment_angles_deg: [num_replicas, num_dirs]
+    spectral_echo: [num_dirs]
+    aligned_replicate_singular_values: [num_replicas, num_dirs]
+    Returns a dict of scalar tensors summarizing multiplicative-noise behavior
+    in the top-k singular directions.
+    """
+    with torch.no_grad():
+        # Handle degenerate case robustly
+        if left_alignment_angles_deg.numel() == 0:
+            zero = torch.zeros((), device=left_alignment_angles_deg.device)
+            return dict(
+                empirical_echo_plateau_top=zero,
+                predicted_echo_plateau_top=zero,
+                left_c2_top_mean=zero,
+                right_c2_top_mean=zero,
+            )
+
+        # Use median singular values across replicas to pick "top_k" directions
+        s_med = torch.median(aligned_replicate_singular_values, dim=0).values  # [D]
+        D = int(s_med.numel())
+        k = min(int(top_k), D)
+        if k == 0:
+            zero = torch.zeros((), device=left_alignment_angles_deg.device)
+            return dict(
+                empirical_echo_plateau_top=zero,
+                predicted_echo_plateau_top=zero,
+                left_c2_top_mean=zero,
+                right_c2_top_mean=zero,
+            )
+
+        top_idx = torch.topk(s_med, k=k, largest=True).indices  # [k]
+
+        # Slice to top-k directions
+        la_top = left_alignment_angles_deg[:, top_idx]   # [R, k]
+        ra_top = right_alignment_angles_deg[:, top_idx]  # [R, k]
+        echo_top = spectral_echo[top_idx]                # [k]
+
+        # Convert degrees to radians, then to cos^2
+        la_rad = torch.deg2rad(la_top)
+        ra_rad = torch.deg2rad(ra_top)
+        cos2L = torch.cos(la_rad) ** 2                   # [R, k]
+        cos2R = torch.cos(ra_rad) ** 2                   # [R, k]
+
+        # Average over replicas for each direction
+        mean_c2L_dir = cos2L.mean(dim=0)                 # [k]
+        mean_c2R_dir = cos2R.mean(dim=0)                 # [k]
+
+        # Predicted echo per direction under multiplicative-noise model
+        pred_echo_dir = torch.sqrt((mean_c2L_dir * mean_c2R_dir).clamp_min(0.0))  # [k]
+
+        # Aggregate to single scalars over top-k directions
+        emp_plateau = torch.median(echo_top).clamp(0.0, 1.0)    # scalar
+        pred_plateau = torch.median(pred_echo_dir).clamp(0.0, 1.0)
+
+        left_c2_top_mean = mean_c2L_dir.mean()
+        right_c2_top_mean = mean_c2R_dir.mean()
+
+        return dict(
+            empirical_echo_plateau_top=emp_plateau,
+            predicted_echo_plateau_top=pred_plateau,
+            left_c2_top_mean=left_c2_top_mean,
+            right_c2_top_mean=right_c2_top_mean,
+        )
+
+
 def _greedy_perm_from_scores(scores: torch.Tensor) -> torch.Tensor:
     """
     Greedy one-to-one assignment done entirely in torch.

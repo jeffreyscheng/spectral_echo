@@ -32,6 +32,38 @@ def _iter_param_layers(panel: GPTLayerProperty, param_type: str):
         yield layer, d
 
 
+def create_multiplicative_plateau_pred_vs_emp_subplot(
+    ax,
+    panel: GPTLayerProperty,
+    param_type: str,
+    viridis,
+    max_layers: int,
+):
+    """
+    Scatter x=predicted plateau, y=empirical plateau (both in [0,1]).
+    One point per layer; color indicates layer depth.
+    """
+    ax.set_title(param_type)
+    ax.set_xlabel("Predicted echo plateau (top-k)")
+    ax.set_ylabel("Empirical echo plateau (top-k)")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="black", alpha=0.7)
+
+    denom = max(1, max_layers - 1)
+    for layer, d in _iter_param_layers(panel, param_type):
+        x = float(d.get("predicted_echo_plateau_top", float("nan")))
+        y = float(d.get("empirical_echo_plateau_top", float("nan")))
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        color = viridis(layer / denom)
+        ax.scatter([x], [y], s=15, alpha=0.9, c=[color])
+
+    return []
+
+
 def create_subplot_grid(
     layer_property: GPTLayerProperty,
     plot_fn: Callable[[plt.Axes, GPTLayerProperty, str, mcolors.Colormap, int], List[Any]],

@@ -19,8 +19,8 @@ from torch.nn import Parameter, Module
 from empirical.research.analysis.constants import FIELD_NAMES
 from empirical.research.training.training_core import distributed_data_generator, get_window_size_blocks
 
-# Type alias for layer properties
-GPTLayerProperty: TypeAlias = dict[tuple[str, int], Parameter | np.ndarray | torch.Tensor]
+# Type alias for layer properties (values include tensors, arrays, scalars, and small dict payloads).
+GPTLayerProperty: TypeAlias = dict[tuple[str, int], Any]
 
 
 def _split_attention_tensor(tensor: torch.Tensor, layer_num: int) -> Iterator[tuple[tuple[str, int], torch.Tensor]]:

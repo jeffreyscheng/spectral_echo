@@ -52,6 +52,7 @@ from empirical.research.analysis.core_math import (
     estimate_gradient_noise_sigma2,
     compute_echo_fit_diagnostics_from_aligned_svds,
     compute_reverb_fit_relative_diagnostics,
+    compute_multiplicative_plateau_stats,
     get_raw_svds,
     get_mean_svd,
     compute_alignment_angles_deg,
@@ -64,6 +65,7 @@ from empirical.research.analysis.core_visualization import (
     create_reverb_fit_relative_residual_vs_echo_loglog_subplot,
     create_reverb_fit_stratified_relative_residual_by_numerator_subplot,
     create_reverb_fit_stratified_relative_residual_by_denominator_subplot,
+    create_multiplicative_plateau_pred_vs_emp_subplot,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
 from empirical.research.analysis.constants import (
@@ -174,6 +176,18 @@ ANALYSIS_SPECS = [
     PropertySpec("triple_mse_bins", ["echo_fit_diagnostics"], lambda d: d["triple_mse_bins"]),
     PropertySpec("triple_mse_by_denom_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_denom_bin"]),
     PropertySpec("triple_mse_by_numer_bin", ["echo_fit_diagnostics"], lambda d: d["triple_mse_by_numer_bin"]),
+
+    # Multiplicative-noise plateau summary (top singular directions)
+    PropertySpec(
+        "multiplicative_plateau_stats",
+        [
+            "left_alignment_angles_deg",
+            "right_alignment_angles_deg",
+            "spectral_echo",
+            "aligned_replicate_singular_values",
+        ],
+        compute_multiplicative_plateau_stats,
+    ),
 
     # Reverb-fit diagnostics (relative-error versions)
     PropertySpec(
@@ -713,6 +727,7 @@ def main():
         sv_gap_ts: Dict[int, GPTLayerProperty] = {}
         left_align_panel_ts: Dict[int, GPTLayerProperty] = {}
         right_align_panel_ts: Dict[int, GPTLayerProperty] = {}
+        mult_plateau_ts: Dict[int, GPTLayerProperty] = {}
         reverb_relres_ts: Dict[int, GPTLayerProperty] = {}
         reverb_numer_ts: Dict[int, GPTLayerProperty] = {}
         reverb_denom_ts: Dict[int, GPTLayerProperty] = {}
@@ -723,6 +738,7 @@ def main():
             sv_gap_ts[step] = build_singular_gap_panel(aggregated_payload)
             left_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="left")
             right_align_panel_ts[step] = build_alignment_angle_vs_sv_panel(aggregated_payload, which="right")
+            mult_plateau_ts[step] = build_multiplicative_plateau_panel(aggregated_payload)
             reverb_relres_ts[step] = build_reverb_fit_relative_residual_panel(aggregated_payload)
             reverb_numer_ts[step] = build_reverb_fit_numerator_stratified_panel(aggregated_payload)
             reverb_denom_ts[step] = build_reverb_fit_denominator_stratified_panel(aggregated_payload)
@@ -736,6 +752,7 @@ def main():
             sv_gap_ts,
             left_align_panel_ts,
             right_align_panel_ts,
+            mult_plateau_ts,
             reverb_relres_ts,
             reverb_numer_ts,
             reverb_denom_ts,
@@ -876,6 +893,32 @@ def build_alignment_angle_vs_sv_panel(
     return out
 
 
+def build_multiplicative_plateau_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Panel payload:
+      - empirical_echo_plateau_top: scalar in [0,1]
+      - predicted_echo_plateau_top: scalar in [0,1]
+      - left_c2_top_mean: scalar
+      - right_c2_top_mean: scalar
+    """
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        stats = props.get("multiplicative_plateau_stats", None)
+        if not isinstance(stats, dict):
+            continue
+        try:
+            out[key] = {
+                "empirical_echo_plateau_top": _to_float_scalar(stats["empirical_echo_plateau_top"]),
+                "predicted_echo_plateau_top": _to_float_scalar(stats["predicted_echo_plateau_top"]),
+                "left_c2_top_mean": _to_float_scalar(stats["left_c2_top_mean"]),
+                "right_c2_top_mean": _to_float_scalar(stats["right_c2_top_mean"]),
+                "shape": tuple(int(x) for x in props["shape"]),
+            }
+        except Exception:
+            continue
+    return out
+
+
 def build_reverb_fit_relative_residual_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     """
     Panel payload:
@@ -957,6 +1000,7 @@ def generate_gifs_for_run(
     sv_gap_ts: Dict[int, GPTLayerProperty],
     left_align_ts: Dict[int, GPTLayerProperty],
     right_align_ts: Dict[int, GPTLayerProperty],
+    mult_plateau_ts: Dict[int, GPTLayerProperty],
     reverb_relres_ts: Dict[int, GPTLayerProperty],
     reverb_numer_ts: Dict[int, GPTLayerProperty],
     reverb_denom_ts: Dict[int, GPTLayerProperty],
@@ -974,6 +1018,14 @@ def generate_gifs_for_run(
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_vs_sv_semilog_subplot, title="right_alignment_z_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(left_align_ts, create_left_alignment_angle_deg_vs_sv_semilog_subplot, title="left_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
     make_gif_from_layer_property_time_series(right_align_ts, create_right_alignment_angle_deg_vs_sv_semilog_subplot, title="right_alignment_angle_deg_vs_singular_value", output_dir=out_dir)
+
+    # Multiplicative plateau prediction test:
+    make_gif_from_layer_property_time_series(
+        mult_plateau_ts,
+        create_multiplicative_plateau_pred_vs_emp_subplot,
+        title="multiplicative_plateau_predicted_vs_empirical",
+        output_dir=out_dir,
+    )
 
     # Reverb-fit diagnostics (relative-error y-axes):
     make_gif_from_layer_property_time_series(
