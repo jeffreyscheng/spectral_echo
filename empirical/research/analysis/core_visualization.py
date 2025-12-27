@@ -7,6 +7,7 @@ across different analysis scripts. It eliminates duplication by providing
 a single, consistent interface for all visualization needs.
 """
 
+import math
 from pathlib import Path
 from typing import Dict, Tuple, Any, List, Callable, Optional
 import numpy as np
@@ -255,14 +256,25 @@ def make_gif_from_layer_property_time_series(
     # 2) Measure per-subplot bounds across all frames (first infer scales from first frame)
     for fig in frames.values():
         fig.canvas.draw()
-    xmins, xmaxs, ymins, ymaxs = get_global_axis_bounds(list(frames.values()))
+    # Only apply global bounds to the 6 data subplots (exclude the colorbar axis).
+    n_panels = len(PARAM_TYPES)
+    xmins, xmaxs, ymins, ymaxs = get_global_axis_bounds(list(frames.values()), n_axes=n_panels)
 
     # 3) Apply global bounds to each frame and save PNGs
     out_dir = Path("research_logs/visualizations") if output_dir is None else Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     png_paths: List[str] = []
     for step, fig in frames.items():
-        for i, ax in enumerate(fig.axes):
+        axes = fig.axes[:n_panels]
+        for i, ax in enumerate(axes):
+            # Guard: never set NaN/Inf limits (can happen if a panel has no data in all frames).
+            if not (
+                np.isfinite(xmins[i])
+                and np.isfinite(xmaxs[i])
+                and np.isfinite(ymins[i])
+                and np.isfinite(ymaxs[i])
+            ):
+                continue
             ax.set_xlim(xmins[i], xmaxs[i])
             ax.set_ylim(ymins[i], ymaxs[i])
         png = out_dir / f"{str(title).replace(' ', '_')}_{step:06d}.png"
@@ -278,27 +290,69 @@ def make_gif_from_layer_property_time_series(
     return gif_path
 
 
-def get_global_axis_bounds(frames: List[plt.Figure]):
+def get_global_axis_bounds(frames: List[plt.Figure], n_axes: int | None = None):
     """Aggregate per-subplot global (xmin,xmax,ymin,ymax) across frames.
 
     Infers log/linear scales from the first frame's axes and enforces
     log-safe minima for log-scaled axes.
     """
     assert frames, "No frames provided"
-    first_axes = frames[0].axes
+    first_axes = frames[0].axes[:n_axes] if n_axes is not None else frames[0].axes
+    n = len(first_axes)
+
     x_is_log = [ax.get_xscale() == 'log' for ax in first_axes]
     y_is_log = [ax.get_yscale() == 'log' for ax in first_axes]
-    n = len(first_axes)
+
     eps = 1e-8
-    xmins = [float('inf')] * n; xmaxs = [float('-inf')] * n
-    ymins = [float('inf')] * n; ymaxs = [float('-inf')] * n
+    # Use NaN sentinels so we can detect "no data anywhere" cleanly.
+    xmins = [np.nan] * n
+    xmaxs = [np.nan] * n
+    ymins = [np.nan] * n
+    ymaxs = [np.nan] * n
+
+    def _acc_min(old: float, new: float) -> float:
+        if not np.isfinite(new):
+            return old
+        if np.isnan(old):
+            return float(new)
+        return float(min(old, new))
+
+    def _acc_max(old: float, new: float) -> float:
+        if not np.isfinite(new):
+            return old
+        if np.isnan(old):
+            return float(new)
+        return float(max(old, new))
+
     for fig in frames:
-        for i, ax in enumerate(fig.axes):
+        axes = fig.axes[:n]  # exclude colorbar axis (and any extras)
+        for i, ax in enumerate(axes):
             bb = ax.dataLim
-            xmins[i] = min(xmins[i], bb.xmin)
-            xmaxs[i] = max(xmaxs[i], bb.xmax)
-            ymins[i] = min(ymins[i], bb.ymin)
-            ymaxs[i] = max(ymaxs[i], bb.ymax)
+            # dataLim can be Inf/-Inf if the axis has no artists/data.
+            xmins[i] = _acc_min(xmins[i], bb.xmin)
+            xmaxs[i] = _acc_max(xmaxs[i], bb.xmax)
+            ymins[i] = _acc_min(ymins[i], bb.ymin)
+            ymaxs[i] = _acc_max(ymaxs[i], bb.ymax)
+
+    # Fallback for panels that had no data across all frames: use first-frame current limits.
+    for i, ax in enumerate(first_axes):
+        if not (np.isfinite(xmins[i]) and np.isfinite(xmaxs[i])):
+            lo, hi = ax.get_xlim()
+            xmins[i] = float(lo)
+            xmaxs[i] = float(hi)
+        if not (np.isfinite(ymins[i]) and np.isfinite(ymaxs[i])):
+            lo, hi = ax.get_ylim()
+            ymins[i] = float(lo)
+            ymaxs[i] = float(hi)
+
+        # Enforce sane ordering / non-degenerate spans.
+        if not (np.isfinite(xmins[i]) and np.isfinite(xmaxs[i])) or xmaxs[i] <= xmins[i]:
+            xmins[i] = eps
+            xmaxs[i] = 1.0
+        if not (np.isfinite(ymins[i]) and np.isfinite(ymaxs[i])) or ymaxs[i] <= ymins[i]:
+            ymins[i] = eps
+            ymaxs[i] = 1.0
+
     for i in range(n):
         if x_is_log[i]:
             xmins[i] = max(xmins[i], eps)
