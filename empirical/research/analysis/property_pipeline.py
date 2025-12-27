@@ -11,7 +11,6 @@ can separate the "what" (property specifications) from the "how" (execution).
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Any, Tuple
 import time
-import logging
 import torch.distributed as dist
 from empirical.research.analysis.logging_utilities import log_from_rank
 from collections import defaultdict, deque
@@ -30,7 +29,7 @@ class PropertySpec:
     """
     name: str
     inputs: List[str]
-    transform: Callable[[Dict[str, Any]], Any]
+    transform: Callable[..., Any]
     
     def __post_init__(self):
         """Validate the specification."""

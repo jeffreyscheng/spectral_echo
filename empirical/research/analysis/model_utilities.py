@@ -8,13 +8,16 @@ and distributed communication functions from the original map.py.
 """
 
 from pathlib import Path
-from typing import Tuple, Iterator, TypeAlias, Callable, Iterable, List
+import io
+import pickle
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, TypeAlias
 import numpy as np
 import torch
 import torch.distributed as dist
 import time
 from torch.nn import Parameter, Module
 from empirical.research.analysis.constants import FIELD_NAMES
+from empirical.research.training.training_core import distributed_data_generator, get_window_size_blocks
 
 # Type alias for layer properties
 GPTLayerProperty: TypeAlias = dict[tuple[str, int], Parameter | np.ndarray | torch.Tensor]
@@ -118,13 +121,6 @@ def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) 
     
     return result
 
-
-# empirical/research/analysis/model_utilities.py
-
-from typing import Dict, Tuple, Any, Optional
-import torch.distributed as dist
-from empirical.research.training.training_core import distributed_data_generator, get_window_size_blocks
-import io, pickle
 
 def get_accumulated_gradient_matrices(
     model,

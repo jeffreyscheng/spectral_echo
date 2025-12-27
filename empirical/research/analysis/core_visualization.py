@@ -7,7 +7,6 @@ across different analysis scripts. It eliminates duplication by providing
 a single, consistent interface for all visualization needs.
 """
 
-import math
 from pathlib import Path
 from typing import Dict, Tuple, Any, List, Callable, Optional
 import numpy as np
@@ -25,6 +24,12 @@ PARAM_TYPES = [
     'Attention Q', 'Attention K', 'Attention V', 
     'Attention O', 'MLP Input', 'MLP Output'
 ]
+
+def _iter_param_layers(panel: GPTLayerProperty, param_type: str):
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        yield layer, d
 
 
 def create_subplot_grid(
@@ -110,9 +115,7 @@ def create_reverb_fit_relative_residual_vs_echo_loglog_subplot(
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
+    for layer, d in _iter_param_layers(panel, param_type):
         x = np.asarray(d.get("echo", []), dtype=float)
         y = np.asarray(d.get("rel_resid", []), dtype=float)
         if x.size == 0 or y.size == 0:
@@ -147,9 +150,7 @@ def create_reverb_fit_stratified_relative_residual_by_denominator_subplot(
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
+    for layer, d in _iter_param_layers(panel, param_type):
         x = np.asarray(d.get("bin_x", []), dtype=float)
         y = np.asarray(d.get("bin_y", []), dtype=float)
         if x.size == 0 or y.size == 0:
@@ -184,9 +185,7 @@ def create_reverb_fit_stratified_relative_residual_by_numerator_subplot(
     ax.grid(True, alpha=0.3)
 
     denom = max(1, max_layers - 1)
-    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type or not isinstance(d, dict):
-            continue
+    for layer, d in _iter_param_layers(panel, param_type):
         x = np.asarray(d.get("bin_x", []), dtype=float)
         y = np.asarray(d.get("bin_y", []), dtype=float)
         if x.size == 0 or y.size == 0:

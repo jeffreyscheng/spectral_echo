@@ -20,7 +20,6 @@ import logging
 import argparse
 from datetime import datetime
 import math
-import itertools
 import os
 import sys
 import re
@@ -368,6 +367,11 @@ def compute_analysis_for_step(
 def to_np16(x):
     if isinstance(x, torch.Tensor):
         return x.detach().to(torch.float16).cpu().numpy()
+    return np.asarray(x)
+
+def _to_numpy(x: Any) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
     return np.asarray(x)
 
 def _to_float_scalar(x: Any) -> float:
@@ -858,7 +862,7 @@ def build_alignment_angle_vs_sv_panel(
         else:
             s_rep_t = torch.as_tensor(s_rep)
         s_dir = torch.median(s_rep_t, dim=0).values.detach().cpu().numpy()
-        ang_np = ang.detach().cpu().numpy() if isinstance(ang, torch.Tensor) else np.asarray(ang)
+        ang_np = _to_numpy(ang)
 
         n = min(s_dir.size, ang_np.shape[1] if ang_np.ndim == 2 else 0)
         if n <= 0:
@@ -884,8 +888,8 @@ def build_reverb_fit_relative_residual_panel(aggregated_payload: GPTLayerPropert
         rr = props.get("reverb_fit_rel_residual_by_echo", None)
         if echo is None or rr is None:
             continue
-        echo_np = echo.detach().cpu().numpy() if isinstance(echo, torch.Tensor) else np.asarray(echo)
-        rr_np = rr.detach().cpu().numpy() if isinstance(rr, torch.Tensor) else np.asarray(rr)
+        echo_np = _to_numpy(echo)
+        rr_np = _to_numpy(rr)
         n = min(int(echo_np.size), int(rr_np.size))
         if n <= 0:
             continue
@@ -909,8 +913,8 @@ def build_reverb_fit_denominator_stratified_panel(aggregated_payload: GPTLayerPr
         y = props.get("reverb_fit_denom_rel_residual", None)
         if x is None or y is None:
             continue
-        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        y_np = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
+        x_np = _to_numpy(x)
+        y_np = _to_numpy(y)
         n = min(int(x_np.size), int(y_np.size))
         if n <= 0:
             continue
@@ -934,8 +938,8 @@ def build_reverb_fit_numerator_stratified_panel(aggregated_payload: GPTLayerProp
         y = props.get("reverb_fit_numer_rel_residual", None)
         if x is None or y is None:
             continue
-        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        y_np = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
+        x_np = _to_numpy(x)
+        y_np = _to_numpy(y)
         n = min(int(x_np.size), int(y_np.size))
         if n <= 0:
             continue

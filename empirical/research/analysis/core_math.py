@@ -15,9 +15,6 @@ except Exception:
     _scipy_curve_fit = None
 import torch
 
-from empirical.research.analysis.model_utilities import GPTLayerProperty
-from empirical.research.analysis.logging_utilities import log_from_rank
-
 
 def compute_stable_rank(singular_values: Union[np.ndarray, torch.Tensor], epsilon: float = 1e-8) -> float:
     """
@@ -136,7 +133,7 @@ def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
     right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
 ) -> torch.Tensor:                # returns echoes with shape (r, Kc)
-    """
+    r"""
     Debiased spectral-echo estimator (no tunable floors, no weights).
 
     Model: independent replicas of \hat{G} = G + E (isotropic), alignment already applied.
