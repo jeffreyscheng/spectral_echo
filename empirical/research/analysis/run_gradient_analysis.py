@@ -88,6 +88,40 @@ def gradients_stable_rank_from_singulars(rep_singulars: torch.Tensor) -> torch.T
         return num / den
 
 
+def estimate_echo_plateau_from_frobenius(
+    per_replicate_gradient: torch.Tensor,
+    mean_gradient: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Method-of-moments estimator for the echo plateau scalar rho:
+
+        rho = S / (S + N),
+
+    using only Frobenius norms of the replicate gradients and their mean.
+
+    Model:
+        G^{(r)} = G + E^{(r)},
+        S = ||G||_F^2,  N = E||E^{(r)}||_F^2
+
+        E||G^{(r)}||_F^2    = S + N
+        E||G_bar||_F^2      = S + N/R
+    """
+    with torch.no_grad():
+        R = per_replicate_gradient.shape[0]
+        if R <= 1:
+            return torch.ones((), device=per_replicate_gradient.device, dtype=per_replicate_gradient.dtype)
+        # x = ||G_bar||_F^2
+        x = torch.sum(mean_gradient * mean_gradient)
+        # y = (1/R) sum_r ||G^{(r)}||_F^2
+        frob2 = torch.sum(per_replicate_gradient * per_replicate_gradient, dim=(-2, -1))  # [R]
+        y = frob2.mean()
+        Rf = float(R)
+        num = Rf * x - y
+        den = (Rf - 1.0) * y
+        rho = num / den
+        return rho.clamp(0.0, 1.0)
+
+
 def _alignment_z_from_angle_deg(angle_deg: tp.Any, d: int) -> np.ndarray:
     """
     z := sqrt(d) * cos(theta), with theta provided in degrees.
@@ -150,6 +184,14 @@ ANALYSIS_SPECS = [
         "replicate_singular_values_fro_normalized",
         ["replicate_singular_values", "per_replicate_gradient_fro_norm"],
         lambda s_rep, fro: s_rep / fro[:, None],
+    ),
+
+    # Layer-level echo plateau prediction (Frobenius-level SNR)
+    # Uses only per-replicate gradients and their mean; O(1) scalars per layer.
+    PropertySpec(
+        "echo_plateau_predicted",
+        ["per_replicate_gradient", "mean_gradient"],
+        estimate_echo_plateau_from_frobenius,
     ),
 
     # Alignment diagnostics: per-atom angles vs mean-gradient directions
@@ -433,6 +475,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "per_replicate_gradient_singular_values",
         "per_replicate_gradient_stable_rank",
         "spectral_echo",
+        "echo_plateau_predicted",
         "shape",
         "gradient_noise_sigma2",
     ]
@@ -450,6 +493,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
+                'echo_plateau_predicted': _to_float_scalar(props['echo_plateau_predicted']),
                 'shape': json.dumps(list(props['shape'])),
                 'gradient_noise_sigma2': grad_sigma2_val,
             }
@@ -806,12 +850,14 @@ def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPT
         s_dir_fro = torch.median(s_rep_fro, dim=0).values.detach().cpu().numpy()  # [D]
 
         echo = props['spectral_echo'].detach().cpu().numpy()  # [D]
+        plateau = _to_float_scalar(props.get('echo_plateau_predicted', 1.0))
         n = min(s_dir.size, s_dir_fro.size, echo.size)
         if n:
             out[key] = {
                 'sv': s_dir[:n],
                 'sv_fro': s_dir_fro[:n],
                 'spectral_echo': echo[:n],
+                'echo_plateau_predicted': float(plateau),
                 'shape': tuple(int(x) for x in props['shape']),
             }
             # optional shape guards
