@@ -10,6 +10,7 @@ FIELD_NAMES = [
     "gradients_stable_rank",
     "replicate_singular_values",
     "replicate_singular_values_fro_normalized",
+    "echo_plateau_predicted",
     "left_alignment_angles_deg",
     "right_alignment_angles_deg",
     "spectral_echo",

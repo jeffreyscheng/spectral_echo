@@ -525,10 +525,8 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sv = d['sv']
-        echo = d['spectral_echo']
-        sv = np.asarray(sv, dtype=float)
-        echo = np.clip(np.asarray(echo, dtype=float), 0.0, 1.0)
+        sv = np.asarray(d['sv'], dtype=float)
+        echo = np.clip(np.asarray(d['spectral_echo'], dtype=float), 0.0, 1.0)
         if sv.size == 0 or echo.size == 0:
             continue
         m = min(sv.size, echo.size)
@@ -536,6 +534,22 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
         color = viridis(layer / denom)
         order = np.argsort(sv)
         ax.scatter(sv[order], echo[order], s=6, alpha=0.25, c=[color])
+
+        # Optional: layer-level predicted plateau as a dotted horizontal line
+        plateau = d.get("echo_plateau_predicted", None)
+        if plateau is not None:
+            try:
+                p = float(plateau)
+            except Exception:
+                p = None
+            if p is not None and np.isfinite(p) and p > 0.0:
+                ax.axhline(
+                    y=p,
+                    linestyle="--",
+                    linewidth=1.0,
+                    color=color,
+                    alpha=0.9,
+                )
     # Common x-grid across panel
     xs = compute_panel_xs(panel)
     # Overlay NS quintic in black (normalized xs)
@@ -573,6 +587,22 @@ def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerPro
         y = echo[mask]
         order = np.argsort(x)
         ax.scatter(x[order], y[order], s=6, alpha=0.25, c=[color])
+
+        # Same predicted plateau as in the un-normalized plot.
+        plateau = d.get("echo_plateau_predicted", None)
+        if plateau is not None:
+            try:
+                p = float(plateau)
+            except Exception:
+                p = None
+            if p is not None and np.isfinite(p) and p > 0.0:
+                ax.axhline(
+                    y=p,
+                    linestyle="--",
+                    linewidth=1.0,
+                    color=color,
+                    alpha=0.9,
+                )
     xs = compute_panel_xs(panel, key="sv_fro")
     if xs.size:
         y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
